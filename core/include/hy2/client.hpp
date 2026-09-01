@@ -1,0 +1,122 @@
+// client.hpp - Hysteria 2 core client. Rewrite of core/client/*.go.
+#pragma once
+
+#include <functional>
+#include <memory>
+#include <string>
+
+#include "hy2/congestion_factory.hpp"
+#include "hy2/io.hpp"
+#include "hy2/protocol.hpp"
+#include "hy2/qstream.hpp"
+#include "hy2/quic.hpp"
+#include "hy2/quic_config.hpp"
+
+namespace hy2::client {
+
+constexpr uint64_t CloseErrCodeOK = 0x100;            // HTTP3 ErrCodeNoError
+constexpr uint64_t CloseErrCodeProtocolError = 0x101; // HTTP3 ErrCodeGeneralProtocolError
+
+// ---------------------------------------------------------------------------
+// Config (config.go)
+
+struct BandwidthConfig {
+    uint64_t MaxTx = 0;
+    uint64_t MaxRx = 0;
+    bool DisableLossCompensation = false;
+};
+
+struct CongestionConfig {
+    std::string Type;      // "bbr" or "reno"
+    std::string BBRProfile;
+};
+
+class Client;
+
+struct Config {
+    std::string ServerAddr; // host:port
+    std::string Auth;
+    TlsClientConfig TLSConfig;
+    QuicConfig QUICConfig;
+    CongestionConfig CongestionCfg;
+    BandwidthConfig BandwidthCfg;
+    bool FastOpen = false;
+
+    // verifyAndFill fills defaults and validates. Mirrors (*Config).verifyAndFill().
+    void VerifyAndFill();
+};
+
+// ClientTransport performs the connection + HTTP/3 auth round trip.
+// A real backend implements this over QUIC+HTTP/3; tests use mocks.
+class ClientTransport {
+public:
+    virtual ~ClientTransport() = default;
+
+    struct AuthResult {
+        std::shared_ptr<IQuicConnection> Conn;
+        int StatusCode = 0;
+        proto::HeaderMap Headers;
+    };
+
+    // Performs the handshake: dials the server, sends the auth request,
+    // returns the connection plus response status/headers. Throws ConnectError
+    // wrappers on failure (the caller maps non-233 statuses to AuthError).
+    virtual AuthResult RoundTrip(const Config& cfg, const proto::AuthRequest& req) = 0;
+};
+
+// Registers the global transport used by NewClient (real QUIC backend).
+void SetGlobalClientTransport(ClientTransport* transport);
+
+// ---------------------------------------------------------------------------
+// HyUDPConn - client-side UDP relay connection.
+
+class HyUDPConn {
+public:
+    virtual ~HyUDPConn() = default;
+    // Receive blocks until a packet arrives. Returns false when closed (EOF).
+    virtual bool Receive(std::vector<uint8_t>& data, std::string& addr) = 0;
+    // Send sends a UDP packet to addr. Throws on error / fragments when needed.
+    virtual void Send(const uint8_t* data, size_t n, const std::string& addr) = 0;
+    virtual void Close() = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Client
+
+class Client {
+public:
+    virtual ~Client() = default;
+    // TCP opens a proxied TCP connection to addr ("host:port").
+    // The returned stream carries payload bytes after handshake completion.
+    virtual std::shared_ptr<IByteReaderWriter> TCP(const std::string& addr) = 0;
+    virtual std::shared_ptr<HyUDPConn> UDP() = 0;
+    virtual void Close() = 0;
+};
+
+struct HandshakeInfo {
+    bool UDPEnabled = false;
+    uint64_t Tx = 0;          // 0 if using BBR
+    std::string ServerAddr;
+    bool ECHAccepted = false;
+};
+
+// NewClient verifies the config, connects and authenticates.
+// Requires SetGlobalClientTransport (or use NewClientWithTransport).
+std::shared_ptr<Client> NewClient(Config config, HandshakeInfo* infoOut = nullptr);
+
+// NewClientWithTransport - dependency-injected variant (tests/custom transports).
+std::shared_ptr<Client> NewClientWithTransport(Config config, ClientTransport& transport,
+                                               HandshakeInfo* infoOut = nullptr);
+
+// ---------------------------------------------------------------------------
+// ReconnectableClient (reconnect.go)
+
+using ConnectedCallback = std::function<void(Client&, const HandshakeInfo&, int)>;
+
+// Creates a reconnectable client. If lazy is true, no connection is made
+// until the first TCP()/UDP() call.
+std::shared_ptr<Client> NewReconnectableClient(
+    std::function<Config()> configFunc, ConnectedCallback connectedFunc = nullptr,
+    bool lazy = true);
+
+} // namespace hy2::client
