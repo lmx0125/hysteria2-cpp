@@ -1,0 +1,24 @@
+# CMake build trees
+build/
+build-*/
+build-test/
+_deps/
+out/
+cmake-build-*/
+
+# IDE
+.vs/
+.vscode/
+*.vcxproj.user
+*.suo
+
+# Compiled binaries / objects
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.tlog

@@ -1,3 +1,0 @@
-/mnt/c/Users/helen/Desktop/codes/hyc/hy2-cpp/build-test/_deps/ngtcp2-subbuild/CMakeFiles/ngtcp2-populate.dir
-/mnt/c/Users/helen/Desktop/codes/hyc/hy2-cpp/build-test/_deps/ngtcp2-subbuild/CMakeFiles/edit_cache.dir
-/mnt/c/Users/helen/Desktop/codes/hyc/hy2-cpp/build-test/_deps/ngtcp2-subbuild/CMakeFiles/rebuild_cache.dir
