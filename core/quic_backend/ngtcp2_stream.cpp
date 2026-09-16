@@ -80,24 +80,21 @@ void Ngtcp2Stream::Write(const uint8_t* p, size_t n) {
         throw hy2::Error("write side closed");
     }
 
-    // Backpressure: an unbounded sender (bwtest hammers Write() with no
-    // pacing) would otherwise pile up hundreds of MB in writeBuf_ while the
-    // peer's cwnd recovers — stalling Drive via lock contention and memory
-    // churn. Cap the pending queue at a few cwnds' worth and block until
-    // Drive() drains it (woken by AdvanceWrite, no polling).
-    constexpr size_t kMaxWriteBuf = 8 * 1024 * 1024;
-    while (writeBuf_.size() > kMaxWriteBuf && !writeClosed_) {
+    // Backpressure on unacknowledged bytes: block until the peer acks enough
+    // of the backlog (OnAckedStreamData wakes us; the timed wait is only a
+    // safety net).
+    while (tailOffset_ - ackedOffset_ > kMaxWriteBuf && !writeClosed_) {
         writeCv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
-            return writeBuf_.size() <= kMaxWriteBuf || writeClosed_;
+            return tailOffset_ - ackedOffset_ <= kMaxWriteBuf || writeClosed_;
         });
     }
     if (writeClosed_) {
         throw hy2::Error("write side closed");
     }
 
-    writeBuf_.insert(writeBuf_.end(), p, p + n);
+    AppendWriteLocked(p, n);
     DBG_LOG("Ngtcp2Stream::Write: appended", "stream_id", streamId_,
-            "bytes", n, "buf_size", writeBuf_.size());
+            "bytes", n, "unacked", tailOffset_ - ackedOffset_);
     // Wake the event-loop thread so it flushes pending data immediately.
     // Edge-triggered: repeated writes inside one burst only pay the pipe
     // syscall once per false->true transition of the pending flag.
@@ -148,7 +145,22 @@ void Ngtcp2Stream::OnStreamData(const uint8_t* data, size_t len, bool fin) {
     if (fin) {
         readEof_ = true;
     }
-    readCv_.notify_all();
+    // No notify here: the connection flushes one wakeup per recv batch.
+    readDirty_ = true;
+}
+
+void Ngtcp2Stream::FlushReadNotify() {
+    bool need = false;
+    {
+        std::lock_guard<std::mutex> lk(readMu_);
+        if (readDirty_) {
+            readDirty_ = false;
+            need = true;
+        }
+    }
+    // Notify with the mutex released: the woken reader re-acquires readMu_
+    // immediately, so holding it here would make it spin first.
+    if (need) readCv_.notify_all();
 }
 
 void Ngtcp2Stream::OnStreamClose(uint64_t /*appErrorCode*/) {
@@ -168,32 +180,77 @@ void Ngtcp2Stream::OnStreamReset(uint64_t /*finalSize*/, uint64_t appErrorCode) 
     OnStreamClose(appErrorCode);
 }
 
-void Ngtcp2Stream::OnAckedStreamData(uint64_t /*offset*/, uint64_t datalen) {
-    // Note: no writeCv_ notify here - an ACK does not change writeBuf_
-    // (that only happens in CopyPendingWrite/AdvanceWrite), so it cannot
-    // unblock a backpressure-waiting Write().
+void Ngtcp2Stream::OnAckedStreamData(uint64_t offset, uint64_t datalen) {
     std::lock_guard<std::mutex> lk(writeMu_);
-    writeAckedPos_ += datalen;
+    // ngtcp2 reports the largest *gap-free* acked offset, i.e. everything
+    // below it is safe to release (retransmissions can no longer need it).
+    const uint64_t acked = offset + datalen;
+    if (acked <= ackedOffset_) return;
+    const bool wasBlocked = tailOffset_ - ackedOffset_ > kMaxWriteBuf;
+    ackedOffset_ = acked;
+    DropAckedLocked();
+    if (wasBlocked && tailOffset_ - ackedOffset_ <= kMaxWriteBuf) {
+        writeCv_.notify_all();
+    }
 }
 
-bool Ngtcp2Stream::CopyPendingWrite(uint8_t* dst, size_t cap, size_t* outLen,
-                                    bool* outFin) {
-    std::lock_guard<std::mutex> lk(writeMu_);
-    *outFin = finPending_;
-    if (writeBuf_.empty()) {
-        *outLen = 0;
-        return finPending_;
+void Ngtcp2Stream::DropAckedLocked() {
+    // Caller holds writeMu_. Frees every chunk whose bytes are fully acked.
+    while (!writeChunks_.empty()) {
+        const WriteChunk& front = writeChunks_.front();
+        if (front.baseOffset + front.data.size() > ackedOffset_) break;
+        writeChunks_.pop_front();
+        if (cursor_ > 0) --cursor_;
     }
-    size_t n = std::min(cap, writeBuf_.size());
-    std::copy_n(writeBuf_.begin(), n, dst);
-    *outLen = n;
-    return true;
+}
+
+void Ngtcp2Stream::AppendWriteLocked(const uint8_t* p, size_t n) {
+    // Caller holds writeMu_. Fills the tail chunk, then adds new 64 KB
+    // chunks. One memcpy per chunk instead of one allocation per element.
+    while (n > 0) {
+        if (writeChunks_.empty() ||
+            writeChunks_.back().data.size() >= kWriteChunkSize) {
+            writeChunks_.emplace_back();
+            writeChunks_.back().baseOffset = tailOffset_;
+            writeChunks_.back().data.reserve(kWriteChunkSize);
+        }
+        WriteChunk& back = writeChunks_.back();
+        size_t space = kWriteChunkSize - back.data.size();
+        size_t take = std::min(space, n);
+        back.data.insert(back.data.end(), p, p + take);
+        tailOffset_ += take;
+        p += take;
+        n -= take;
+    }
+}
+
+const uint8_t* Ngtcp2Stream::PeekPendingWrite(size_t* len, bool* fin) {
+    std::lock_guard<std::mutex> lk(writeMu_);
+    *fin = finPending_;
+    if (sentOffset_ >= tailOffset_ || writeChunks_.empty()) {
+        *len = 0;
+        return nullptr;
+    }
+    // The send cursor may have moved past chunks that are still unacked
+    // (they are kept for retransmission), so walk to the chunk that covers
+    // sentOffset_. cursor_ makes this O(1) amortized.
+    while (cursor_ < writeChunks_.size()) {
+        const WriteChunk& c = writeChunks_[cursor_];
+        if (sentOffset_ < c.baseOffset + c.data.size()) {
+            const size_t off = static_cast<size_t>(sentOffset_ - c.baseOffset);
+            *len = c.data.size() - off;
+            return c.data.data() + off;
+        }
+        ++cursor_;
+    }
+    *len = 0;
+    return nullptr;
 }
 
 bool Ngtcp2Stream::HasPendingWrite() const {
     std::lock_guard<std::mutex> lk(writeMu_);
     // Note: a locally-closed stream still needs to flush queued data + FIN.
-    return !writeBuf_.empty() || finPending_;
+    return sentOffset_ < tailOffset_ || finPending_;
 }
 
 bool Ngtcp2Stream::FinPending() const {
@@ -203,16 +260,14 @@ bool Ngtcp2Stream::FinPending() const {
 
 void Ngtcp2Stream::AdvanceWrite(size_t n) {
     std::lock_guard<std::mutex> lk(writeMu_);
-    if (n >= writeBuf_.size()) {
-        writeBuf_.clear();
+    // Only move the send cursor: the bytes stay buffered until the peer acks
+    // them, because ngtcp2 re-reads them for retransmissions. Freeing happens
+    // in OnAckedStreamData()/DropAckedLocked().
+    if (static_cast<uint64_t>(n) > tailOffset_ - sentOffset_) {
+        sentOffset_ = tailOffset_;  // defensive: never run past the tail
     } else {
-        // Front-erase on a deque destroys only the consumed elements; the
-        // remaining backlog is not shifted (a vector would memmove it all).
-        writeBuf_.erase(writeBuf_.begin(),
-                        writeBuf_.begin() + static_cast<std::ptrdiff_t>(n));
+        sentOffset_ += n;
     }
-    // Wake any Write() blocked by the backpressure cap.
-    writeCv_.notify_all();
 }
 
 void Ngtcp2Stream::ClearFinPending() {

@@ -214,8 +214,13 @@ void Ngtcp2Listener::RegisterConn(uint64_t key,
 #else
     if (wakeWrite_ >= 0) conn->SetWakeFd(&wakeWrite_);
 #endif
-    std::lock_guard<std::mutex> lk(connsMu_);
-    conns_[key] = std::move(conn);
+    {
+        std::lock_guard<std::mutex> lk(connsMu_);
+        conns_[key] = conn;
+    }
+    // Each server connection gets its own worker loop so QUIC processing
+    // scales across cores instead of serializing on the listener thread.
+    conn->StartServerLoop();
 }
 
 void Ngtcp2Listener::NotifyHandshakeComplete(std::shared_ptr<IQuicConnection> conn) {
@@ -262,16 +267,25 @@ void Ngtcp2Listener::HandlePacket(const uint8_t* data, size_t len,
         isInitial && ngtcp2_accept(&hd, data, len) == 0;
 
     if (existing && parsedInitial) {
-        const ngtcp2_cid* oldClientScid = &existing->ClientScid();
-        bool sameConn = oldClientScid->datalen == hd.scid.datalen &&
-                        memcmp(oldClientScid->data, hd.scid.data,
-                               hd.scid.datalen) == 0;
-        if (!sameConn) {
+        // A client Initial always carries the server's SCID as its DCID.
+        // Comparing the DCID distinguishes a retransmitted Initial of the
+        // existing connection from a brand-new connection reusing the same
+        // UDP 4-tuple. (The hy2 client uses a zero-length SCID, so the old
+        // SCID comparison wrongly treated every reconnect as a retransmit.)
+        const ngtcp2_cid& oldServerScid = existing->ServerScid();
+        bool sameConn = hd.dcid.datalen == oldServerScid.datalen &&
+                        memcmp(oldServerScid.data, hd.dcid.data,
+                               hd.dcid.datalen) == 0;
+        if (!sameConn || existing->IsClosed()) {
             if (QuicDebugEnabled()) {
                 std::fprintf(stderr,
                              "[quic] new Initial on same 4-tuple - replacing "
                              "stale connection\n");
             }
+            // Stop the old worker loop first: otherwise it keeps sending
+            // packets for the old connection towards the new client, which
+            // can kill the fresh handshake (stateless reset handling).
+            existing->Abort();
             std::lock_guard<std::mutex> lk(connsMu_);
             conns_.erase(key);
             existing.reset();
@@ -307,7 +321,11 @@ void Ngtcp2Listener::HandlePacket(const uint8_t* data, size_t len,
         existing = conn;
     }
 
-    existing->OnUdpRecv(data, len, from, fromlen);
+    // Hand the datagram to the connection's own worker loop (see
+    // Ngtcp2Connection::ServerLoop). The listener must never call
+    // OnUdpRecv/Drive here: doing so serializes every connection's crypto
+    // on this single thread.
+    existing->EnqueueRx(data, len);
 }
 
 void Ngtcp2Listener::RecvLoop() {
@@ -353,7 +371,12 @@ void Ngtcp2Listener::RecvLoop() {
 #else
         int wakeFd = wakeRead_;
 #endif
-        IoWaitResult res = IoWait(GetFd(), wakeFd, GetNearestExpiry());
+        // Timers are handled by each connection's own worker loop, so the
+        // listener only waits for socket data / the wake pipe. A 100 ms cap
+        // keeps close/shutdown responsive without busy-waiting.
+        IoWaitResult res = IoWait(GetFd(), wakeFd,
+                                  std::chrono::steady_clock::now() +
+                                      std::chrono::milliseconds(100));
         if (res == IoWaitResult::kError) break;
         if (!running_) break;
 
@@ -382,23 +405,8 @@ void Ngtcp2Listener::RecvLoop() {
                          reinterpret_cast<struct sockaddr*>(&local), locallen);
         }
 
-        // Timers + flushes. Only connections that owe packets (incoming
-        // data, stream writes, or an overdue timer) are driven - this
-        // keeps the cost per event O(active) instead of O(all conns).
-        std::vector<std::shared_ptr<Ngtcp2Connection>> snapshot;
-        {
-            std::lock_guard<std::mutex> lk(connsMu_);
-            snapshot.reserve(conns_.size());
-            for (auto& kv : conns_) snapshot.push_back(kv.second);
-        }
-        for (auto& c : snapshot) {
-            if (c->TimerOverdue()) {
-                c->OnTimeout();
-            }
-            if (c->ConsumeTxPending()) {
-                c->Drive();
-            }
-        }
+        // Timers + flushes run on each connection's own worker loop
+        // (Ngtcp2Connection::ServerLoop) - nothing to drive here.
 
         // Drop closed connections periodically.
         {
@@ -457,6 +465,20 @@ void Ngtcp2Listener::Close() {
             recvThread_.join();
         }
     }
+
+    // Stop every connection's worker loop before releasing the map.
+    {
+        std::vector<std::shared_ptr<Ngtcp2Connection>> conns;
+        {
+            std::lock_guard<std::mutex> lk(connsMu_);
+            for (auto& kv : conns_) conns.push_back(kv.second);
+            conns_.clear();
+        }
+        for (auto& c : conns) {
+            c->StopServerLoop();
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lk(pendingMu_);
         pendingConns_.clear();

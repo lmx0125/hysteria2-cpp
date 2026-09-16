@@ -29,9 +29,13 @@ public:
     uint32_t ID = 0;
     frag::Defragger D;
     std::shared_ptr<Channel<std::shared_ptr<const proto::UDPMessage>>> ReceiveCh;
-    UdpIO* IO = nullptr;
+    // Shared ownership: an outstanding relay connection must keep its IO (and
+    // through it the QUIC connection) alive. With a raw pointer, destroying
+    // the Client while sessions were still in use left Send()/Receive()
+    // writing through a dangling UdpIO* (crash: 0xC0000005 in UdpConn::Send).
+    std::shared_ptr<UdpIO> IO;
 
-    UdpConn(uint32_t id, UdpIO* io);
+    UdpConn(uint32_t id, std::shared_ptr<UdpIO> io);
 
     bool Receive(std::vector<uint8_t>& data, std::string& addr) override;
     void Send(const uint8_t* data, size_t n, const std::string& addr) override;
@@ -49,7 +53,7 @@ class ClientUdpSessionManager : public std::enable_shared_from_this<ClientUdpSes
 public:
     // Factory: use this instead of the constructor - it starts the receive
     // loop with proper shared ownership.
-    static std::shared_ptr<ClientUdpSessionManager> Create(UdpIO* io);
+    static std::shared_ptr<ClientUdpSessionManager> Create(std::shared_ptr<UdpIO> io);
 
     ~ClientUdpSessionManager();
 
@@ -57,14 +61,14 @@ public:
     size_t Count();
 
 private:
-    explicit ClientUdpSessionManager(UdpIO* io);
+    explicit ClientUdpSessionManager(std::shared_ptr<UdpIO> io);
 
     void run();
     void closeCleanup();
     void feed(std::shared_ptr<const proto::UDPMessage> msg);
     void closeConn(const std::shared_ptr<UdpConn>& conn);
 
-    UdpIO* io_;
+    std::shared_ptr<UdpIO> io_;
     std::shared_mutex mutex_;
     std::map<uint32_t, std::shared_ptr<UdpConn>> m_;
     uint32_t nextID_ = 1;

@@ -75,6 +75,15 @@ void Config::Fill() {
     if (BandwidthCfg.MaxRx != 0 && BandwidthCfg.MaxRx < 65536) {
         throw ConfigError("BandwidthConfig.MaxRx", "must be at least 65536");
     }
+    // Declared send bandwidth -> fixed-rate Brutal sender (see client.cpp).
+    // The rate is refined after the handshake with min(client Rx, MaxTx).
+    if (QUICConfig.CongestionControl.empty()) {
+        QUICConfig.CongestionControl = CongestionCfg.Type;
+    }
+    if (BandwidthCfg.MaxTx > 0) {
+        QUICConfig.CongestionControl = "brutal";
+        QUICConfig.BrutalRate = BandwidthCfg.MaxTx;
+    }
     if (UDPIdleTimeout.ns == 0) {
         UDPIdleTimeout = kDefaultUDPIdleTimeout;
     } else if (UDPIdleTimeout < Duration::FromSeconds(2) ||

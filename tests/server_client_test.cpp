@@ -1,4 +1,4 @@
-ï»¿// server_client_test.cpp - Session logic tests for server UDP manager,
+// server_client_test.cpp - Session logic tests for server UDP manager,
 // client UDP manager, H3sHandler auth/TCP flow and reconnectable client.
 // Mirrors behaviors tested by core/server/udp_test.go, core/client/udp_test.go
 // and core/internal/integration_tests in the Go implementation.
@@ -234,7 +234,8 @@ HY_TEST(ClientUdpSessionIdsAndRouting)
 {
     MockQuicConnection conn;
     CountingClientIO io(conn);
-    auto mgr = ClientUdpSessionManager::Create(&io);
+    auto ioPtr = std::shared_ptr<CountingClientIO>(&io, [](CountingClientIO*) {});
+    auto mgr = ClientUdpSessionManager::Create(ioPtr);
 
     auto c1 = mgr->NewUDP();
     auto c2 = mgr->NewUDP();
@@ -287,7 +288,8 @@ HY_TEST(ClientUdpSendAutoFragmentation)
     MockQuicConnection conn;
     conn.maxDatagramPayloadSize_ = 60; // force fragmentation
     CountingClientIO io(conn);
-    auto mgr = ClientUdpSessionManager::Create(&io);
+    auto ioPtr = std::shared_ptr<CountingClientIO>(&io, [](CountingClientIO*) {});
+    auto mgr = ClientUdpSessionManager::Create(ioPtr);
 
     auto c = mgr->NewUDP();
 
@@ -570,7 +572,7 @@ HY_TEST(ServerHandleTCPRequestProxying)
 HY_TEST(QuicConfigDisableChromeParrotDefault)
 {
     // Official Go: DisableChromeParrot bool // Chrome QUIC fingerprint parroting is on by default.
-    // Default is false â†’ ChromeParrot ON â†’ zero-length SCID
+    // Default is false ¡ú ChromeParrot ON ¡ú zero-length SCID
     QuicConfig cfg;
     HY_CHECK_EQ(cfg.DisableChromeParrot, false);
 }
@@ -593,8 +595,8 @@ HY_TEST(QuicConfigDisableChromeParrotSemantic)
     // The semantic matches Go:
     //   ChromeParrot = !c.config.QUICConfig.DisableChromeParrot
     // So:
-    //   DisableChromeParrot=false â†’ ChromeParrot=true â†’ zero-length SCID
-    //   DisableChromeParrot=true  â†’ ChromeParrot=false â†’ 8-byte SCID
+    //   DisableChromeParrot=false ¡ú ChromeParrot=true ¡ú zero-length SCID
+    //   DisableChromeParrot=true  ¡ú ChromeParrot=false ¡ú 8-byte SCID
     QuicConfig cfg;
 
     cfg.DisableChromeParrot = false;

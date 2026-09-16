@@ -160,6 +160,72 @@ if(HY2_WITH_QUIC_BACKEND)
     )
     FetchContent_MakeAvailable(ngtcp2)
 
+    # --- ngtcp2 patch: fixed-rate loss-insensitive "Brutal" CC ---------------
+    # Hysteria's sender for lossy long-RTT paths: window = rate * srtt and
+    # loss never shrinks it.  ngtcp2 has no custom-CC hook, so the algorithm
+    # is injected into its sources here (same in-place approach as the
+    # nghttp3 patch below; each build tree has its own _deps copy, so this
+    # runs once per tree).  The marker string keeps it idempotent across
+    # re-configures.  Snippets live in third_party/ngtcp2_brutal/.
+    set(_hy2_brutal_dir "${CMAKE_CURRENT_SOURCE_DIR}/ngtcp2_brutal")
+
+    set(_ngtcp2_h "${ngtcp2_SOURCE_DIR}/lib/includes/ngtcp2/ngtcp2.h")
+    file(READ "${_ngtcp2_h}" _f)
+    if(NOT _f MATCHES "ngtcp2_hy2_brutal_patch")
+        file(READ "${_hy2_brutal_dir}/ngtcp2_h.enum.inc" _inc)
+        string(REPLACE "NGTCP2_CC_ALGO_BBR = 0x02\n} ngtcp2_cc_algo;"
+                       "NGTCP2_CC_ALGO_BBR = 0x02,\n${_inc}} ngtcp2_cc_algo;"
+                       _f "${_f}")
+        file(READ "${_hy2_brutal_dir}/ngtcp2_h.decl.inc" _inc)
+        string(REPLACE "NGTCP2_EXTERN uint64_t ngtcp2_conn_get_cwnd_left2(const ngtcp2_conn *conn);"
+                       "NGTCP2_EXTERN uint64_t ngtcp2_conn_get_cwnd_left2(const ngtcp2_conn *conn);\n${_inc}"
+                       _f "${_f}")
+        file(WRITE "${_ngtcp2_h}" "${_f}")
+        message(STATUS "Patched ngtcp2: brutAL CC API (${_ngtcp2_h})")
+    endif()
+
+    # The controller lives next to BBR (ngtcp2_bbr.h/.c): that header has the
+    # complete ngtcp2_cc_bbr type and is already included by ngtcp2_conn.h.
+    set(_ngtcp2_bbr_h "${ngtcp2_SOURCE_DIR}/lib/ngtcp2_bbr.h")
+    file(READ "${_ngtcp2_bbr_h}" _f)
+    if(NOT _f MATCHES "ngtcp2_hy2_brutal_patch")
+        file(READ "${_hy2_brutal_dir}/bbr_h.inc" _inc)
+        string(REPLACE "} ngtcp2_cc_bbr;"
+                       "} ngtcp2_cc_bbr;\n\n${_inc}\n/* ngtcp2_hy2_brutal_patch */"
+                       _f "${_f}")
+        file(WRITE "${_ngtcp2_bbr_h}" "${_f}")
+    endif()
+
+    set(_ngtcp2_conn_h "${ngtcp2_SOURCE_DIR}/lib/ngtcp2_conn.h")
+    file(READ "${_ngtcp2_conn_h}" _f)
+    if(NOT _f MATCHES "ngtcp2_hy2_brutal_patch")
+        file(READ "${_hy2_brutal_dir}/conn_h.inc" _inc)
+        string(REPLACE "  ngtcp2_cc_bbr bbr;"
+                       "  ngtcp2_cc_bbr bbr;\n${_inc}/* ngtcp2_hy2_brutal_patch */"
+                       _f "${_f}")
+        file(WRITE "${_ngtcp2_conn_h}" "${_f}")
+    endif()
+
+    set(_ngtcp2_conn_c "${ngtcp2_SOURCE_DIR}/lib/ngtcp2_conn.c")
+    file(READ "${_ngtcp2_conn_c}" _f)
+    if(NOT _f MATCHES "ngtcp2_hy2_brutal_patch")
+        file(READ "${_hy2_brutal_dir}/conn_c.case.inc" _inc)
+        string(REPLACE "  case NGTCP2_CC_ALGO_BBR:"
+                       "${_inc}\n  case NGTCP2_CC_ALGO_BBR:"
+                       _f "${_f}")
+        file(READ "${_hy2_brutal_dir}/conn_c.inc" _inc)
+        set(_f "${_f}\n/* ngtcp2_hy2_brutal_patch */\n${_inc}")
+        file(WRITE "${_ngtcp2_conn_c}" "${_f}")
+    endif()
+
+    set(_ngtcp2_bbr_c "${ngtcp2_SOURCE_DIR}/lib/ngtcp2_bbr.c")
+    file(READ "${_ngtcp2_bbr_c}" _f)
+    if(NOT _f MATCHES "ngtcp2_hy2_brutal_patch")
+        file(READ "${_hy2_brutal_dir}/bbr_c.inc" _inc)
+        set(_f "${_f}\n/* ngtcp2_hy2_brutal_patch */\n${_inc}")
+        file(WRITE "${_ngtcp2_bbr_c}" "${_f}")
+    endif()
+
     # --- nghttp3 (HTTP/3 framing + QPACK) ---
     set(ENABLE_STATIC_LIB ON CACHE BOOL "" FORCE)
     set(ENABLE_SHARED_LIB OFF CACHE BOOL "" FORCE)

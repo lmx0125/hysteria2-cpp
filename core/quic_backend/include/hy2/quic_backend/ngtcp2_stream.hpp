@@ -42,7 +42,15 @@ public:
     void SetWriteDeadline(MonoTime t) override { writeDeadline_ = t; }
 
     // Called by Ngtcp2Connection when data arrives on this stream.
+    // Does NOT wake a blocked reader: it only marks the stream dirty. The
+    // connection calls FlushReadNotify() once per received batch, so a
+    // 60-packet burst costs one reader wakeup instead of 60. Both sides
+    // used to pay a full condition-variable round trip per packet.
     void OnStreamData(const uint8_t* data, size_t len, bool fin);
+
+    // Wake a reader blocked in Read() if new data/EOF arrived since the last
+    // flush. Safe to call on any stream (no-op when nothing changed).
+    void FlushReadNotify();
 
     // Called by Ngtcp2Connection when the peer closes/resets this stream.
     void OnStreamClose(uint64_t appErrorCode);
@@ -52,12 +60,20 @@ public:
     void OnAckedStreamData(uint64_t offset, uint64_t datalen);
 
     // Write-side plumbing used by Ngtcp2Connection::Drive():
-    // Copies pending (unwritten) bytes into dst (up to cap) and reports
-    // whether a FIN is pending, all under one writeMu_ acquisition.
-    // Returns true if there was anything pending.
-    bool CopyPendingWrite(uint8_t* dst, size_t cap, size_t* outLen, bool* outFin);
+    // Zero-copy: returns a pointer to the next contiguous run of unsent write
+    // data. The pointer stays valid until the peer acknowledges those bytes -
+    // ngtcp2 re-reads every submitted byte when a packet must be retransmitted
+    // ("the caller must keep the portion of data covered by *pdatalen intact
+    // until acked_stream_data_offset indicates that they are acknowledged").
+    // Drive() calls AdvanceWrite() right after ngtcp2_conn_writev_stream()
+    // returns, which only advances the send cursor, never frees the chunk.
+    // Returns nullptr with *len == 0 when no data is pending; *fin reports
+    // a queued FIN.
+    const uint8_t* PeekPendingWrite(size_t* len, bool* fin);
     bool HasPendingWrite() const;
     bool FinPending() const;
+    // Marks n bytes as handed to ngtcp2 (the data stays buffered for
+    // retransmission until the peer acks it).
     void AdvanceWrite(size_t n);
     void ClearFinPending();
     // Mark the local write side finished (sends FIN).
@@ -76,14 +92,36 @@ private:
     size_t readPos_ = 0;
     bool readEof_ = false;
     bool readClosed_ = false;
+    // Set by OnStreamData, cleared by FlushReadNotify (guarded by readMu_).
+    bool readDirty_ = false;
 
     mutable std::mutex writeMu_;
-    // deque: Write appends at the back, Drive advances from the front.
-    // A vector would memmove the whole remaining backlog on every
-    // AdvanceWrite — O(buffer size) per packet, freezing the loop once
-    // the backlog grows large.
-    std::deque<uint8_t> writeBuf_;
-    size_t writeAckedPos_ = 0;   // how much has been acked
+    // Chunked buffer holding every byte that is not acknowledged yet: ngtcp2
+    // keeps references to the submitted data and re-reads it on
+    // retransmissions, so a chunk can only be released once the contiguous
+    // acked offset (ngtcp2 hands us the largest gap-free offset) passes its
+    // end. Encoding a packet therefore no longer frees anything - it only
+    // moves the send cursor. Large pre-reserved chunks keep appends
+    // O(1)-amortized and give the send path one memcpy per packet.
+    static constexpr size_t kWriteChunkSize = 64 * 1024;
+    struct WriteChunk {
+        std::vector<uint8_t> data;
+        uint64_t baseOffset = 0;  // absolute stream offset of data[0]
+    };
+    std::deque<WriteChunk> writeChunks_;
+    size_t cursor_ = 0;         // index of the chunk that holds sentOffset_
+    uint64_t ackedOffset_ = 0;  // largest gap-free offset acked by the peer
+    uint64_t sentOffset_ = 0;   // next byte to hand to ngtcp2
+    uint64_t tailOffset_ = 0;   // end of all appended data
+    void AppendWriteLocked(const uint8_t* p, size_t n);
+    void DropAckedLocked();
+
+    // Backpressure cap on unacknowledged bytes: an unbounded sender would
+    // pile up hundreds of MB while the peer's cwnd recovers (or a lossy path
+    // keeps data in flight). Write() blocks above this; the ack callback
+    // wakes it once the level drops back below the cap.
+    static constexpr size_t kMaxWriteBuf = 8 * 1024 * 1024;
+
     bool writeClosed_ = false;
     bool finPending_ = false;    // FIN queued but not yet written into a packet
 

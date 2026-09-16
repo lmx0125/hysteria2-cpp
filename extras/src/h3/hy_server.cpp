@@ -18,6 +18,8 @@ HyServer::HyServer(const HyServerParams& params,
     sp.certChainPEM = {params_.certPem};
     sp.privateKeyPEM = {params_.keyPem};
     sp.datagramEnabled = true;
+    // Make the configured congestion controller reach the QUIC transport.
+    sp.quicCfg.CongestionControl = params_.congestionType;
 
     listener_ = quic_backend::Ngtcp2Listener::Create(sp);
     if (!listener_) {
@@ -46,8 +48,17 @@ void HyServer::AcceptLoop() {
         }
         if (!conn) break;
 
+        HySessionConfig sessionCfg;
+        sessionCfg.udpEnabled = params_.udpEnabled;
+        sessionCfg.ignoreClientBandwidth = params_.ignoreClientBandwidth;
+        sessionCfg.bandwidthMaxTx = params_.bandwidthMaxTx;
+        sessionCfg.bandwidthMaxRx = params_.bandwidthMaxRx;
+        sessionCfg.congestionType = params_.congestionType;
+        sessionCfg.bbrProfile = params_.bbrProfile;
+        sessionCfg.disableLossCompensation = params_.disableLossCompensation;
+
         auto session = std::shared_ptr<HySession>(
-            new HySession(conn, auth_, outbound_, params_.udpEnabled));
+            new HySession(conn, auth_, outbound_, sessionCfg));
         {
             std::lock_guard<std::mutex> lk(reg_->mu);
             reg_->list.push_back(session);

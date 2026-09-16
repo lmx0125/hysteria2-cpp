@@ -4,6 +4,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -36,7 +37,11 @@ public:
     UdpSocket& operator=(UdpSocket&& o) noexcept;
 
     bool Bind(const std::string& addr, uint16_t port);
-    bool Connect(const std::string& addr, uint16_t port);
+    // localBindAddr (optional): bind the socket's local address before
+    // connecting, pinning egress to the interface that owns that address.
+    // Ignored when empty or when its address family differs from the peer's.
+    bool Connect(const std::string& addr, uint16_t port,
+                 const std::string& localBindAddr = std::string());
 
     // Non-blocking send. Returns bytes sent, or -1 on WOULDBLOCK/error.
     // On WOULDBLOCK, the packet is queued internally.
@@ -67,7 +72,7 @@ public:
     size_t GetMaxDatagramSize() const { return maxDatagramSize_; }
 
     // Check if there are queued packets waiting to be sent.
-    bool HasQueuedPackets() const { return !txQueue_.empty(); }
+    bool HasQueuedPackets() const;
 
     // Monitoring counters for performance analysis.
     struct Stats {
@@ -80,8 +85,8 @@ public:
         uint64_t rxPackets = 0;          // packets received
         size_t txQueuePeak = 0;          // peak queue depth
     };
-    const Stats& GetStats() const { return stats_; }
-    void ResetStats() { stats_ = {}; }
+    Stats GetStats() const;
+    void ResetStats();
 
     // Read actual kernel socket buffer sizes (after setsockopt).
     struct BufferSizes {
@@ -106,6 +111,10 @@ private:
 
     int fd_ = -1;
     size_t maxDatagramSize_ = 1350;
+    // Guards txQueue_ and the diagnostic counters. The hot send path only
+    // takes this lock when the kernel buffer is full (rare), so concurrent
+    // senders (one worker thread per server connection) do not serialize.
+    mutable std::mutex txMu_;
     std::deque<TxPacket> txQueue_;
     static constexpr size_t kMaxTxQueue = 256; // max queued packets
     Stats stats_;

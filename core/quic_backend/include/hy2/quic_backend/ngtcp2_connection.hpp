@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -68,6 +70,9 @@ public:
     struct ClientParams {
         std::string remoteAddr;       // "host:port"
         std::string serverName;       // SNI
+        // Optional local address to bind the QUIC socket to (pins egress to
+        // the interface owning it; see QuicConfig::LocalBindAddr).
+        std::string localBindAddr;
         uint16_t remotePort = 0;
         // TLS
         SSL_CTX* sslCtx = nullptr;
@@ -120,6 +125,25 @@ public:
     // Called by event loop when UDP datagram arrives.
     void OnUdpRecv(const uint8_t* data, size_t len,
                    const struct sockaddr* addr, socklen_t addrlen);
+
+    // ---- Server-side per-connection worker loop ----
+    // Ngtcp2Listener::RecvLoop only receives datagrams and hands them to the
+    // owning connection via EnqueueRx(); ServerLoop() then performs
+    // read_pkt/Drive()/timers on this connection's own thread. Without this,
+    // every server connection's crypto ran on the single listener thread,
+    // capping total server throughput at roughly one CPU core
+    // (~250-300 Mbps on a laptop).
+    void EnqueueRx(const uint8_t* data, size_t len);
+    void StartServerLoop();
+    void StopServerLoop();
+    // Batch variant used by the server worker loop: one op-lock acquisition
+    // for a whole batch of datagrams instead of one per packet.
+    void OnUdpRecvBatch(const std::deque<std::vector<uint8_t>>& batch);
+
+    // Immediately stops this connection without sending CONNECTION_CLOSE.
+    // Used when a stale connection is replaced on a reused UDP 4-tuple so
+    // its worker loop stops emitting packets towards the new client.
+    void Abort();
 
     // Called by event loop on timeout.
     void OnTimeout();
@@ -179,6 +203,10 @@ public:
     // Check if handshake is complete.
     bool IsHandshakeComplete() const { return handshakeComplete_.load(); }
 
+    // True once the connection reached a terminal state (idle close, peer
+    // CONNECTION_CLOSE/draining, or explicit local close).
+    bool IsClosed() const { return closed_.load(); }
+
     // Get ngtcp2 connection ID for logging.
     uint64_t GetConnectionId() const;
 
@@ -219,6 +247,12 @@ public:
     // equals dcid_ which we set from the client Initial's SCID).
     const ngtcp2_cid& ClientScid() const { return dcid_; }
 
+    // The server-chosen source CID: a client Initial for THIS connection
+    // carries it as its destination CID. Used by the listener to tell a
+    // retransmitted Initial apart from a brand-new connection (the hy2
+    // client uses zero-length SCIDs, so SCIDs cannot be compared).
+    const ngtcp2_cid& ServerScid() const { return scid_; }
+
     // Serializes ALL ngtcp2 entry points (Drive/OnUdpRecv/OnTimeout +
     // app-thread OpenStream/SendDatagram/CloseWithError). ngtcp2 requires
     // monotonically increasing timestamps per connection, so these must
@@ -250,6 +284,16 @@ private:
     bool InitTls();
     bool InitServer(const ServerInitParams& p);
     bool InitCommonCallbacks();
+
+    // Processes one datagram; caller must hold opMu_ (BeginOpBlocking()).
+    // Returns false once the connection reached a terminal state.
+    bool ReadPacketLocked(const uint8_t* data, size_t len);
+
+    // Wake readers of every stream that received data during the last read
+    // batch. Must run on the IO thread right after draining the socket and
+    // before Drive() (which may destroy closed streams).
+    void FlushReadNotifyBatch();
+    std::vector<Ngtcp2Stream*> readDirtyStreams_;
 
     // ngtcp2 callbacks (static trampolines to instance methods)
     static int SendPktCb(ngtcp2_conn* conn, const uint8_t* dgram, size_t dgramlen,
@@ -367,8 +411,33 @@ private:
     std::atomic<bool> stopLoop_{false};
     std::atomic<bool> loopRunning_{false};
 
+    // Server-side worker loop state
+    void ServerLoop();
+    std::deque<std::vector<uint8_t>> rxQueue_;
+    // Recycled datagram buffers for the listener -> worker handoff: avoids
+    // one malloc/free per received packet.
+    std::vector<std::vector<uint8_t>> rxPool_;
+    // Edge trigger for rxCv_: the listener only wakes the worker on the first
+    // enqueue after the worker drained the queue (guarded by rxMu_).
+    bool rxNotifyArmed_ = false;
+    std::mutex rxMu_;
+    std::condition_variable rxCv_;
+    std::thread serverLoopThread_;
+    std::atomic<bool> serverLoopStop_{false};
+    std::atomic<bool> serverLoopRunning_{false};
+    static constexpr size_t kMaxRxQueue = 8192;
+    static constexpr size_t kMaxRxPool = 8192;
+
+    // Cached ngtcp2 path (local/remote addresses never change after init).
+    ngtcp2_path_storage cachedPath_{};
+    bool cachedPathReady_ = false;
+    ngtcp2_path* GetPath();
+
     std::atomic<bool> handshakeComplete_{false};
     std::condition_variable handshakeCv_;
+    // Bound for waiting on the handshake (QuicConfig::HandshakeTimeout, 10s
+    // default). Node probing uses a short one so unreachable nodes fail fast.
+    std::chrono::milliseconds handshakeTimeout_{10000};
     std::atomic<bool> closed_{false};
     std::atomic<bool> datagramTxEnabled_{false};
     std::atomic<bool> txPending_{false};

@@ -70,6 +70,20 @@ void Config::VerifyAndFill() {
     if (CongestionCfg.Type == cc::TypeBBR) {
         CongestionCfg.BBRProfile = cc::NormalizeBBRProfile(CongestionCfg.BBRProfile);
     }
+    // The QUIC transport must actually use the configured controller;
+    // without this the ngtcp2 backend silently stayed on CUBIC regardless
+    // of CongestionCfg.Type.
+    if (QUICConfig.CongestionControl.empty()) {
+        QUICConfig.CongestionControl = CongestionCfg.Type;
+    }
+    // A declared upload bandwidth means "send at this fixed rate and ignore
+    // loss" - that is Hysteria's Brutal sender, and the ngtcp2 backend now
+    // implements it (patched NGTCP2_CC_ALGO_BRUTAL). Without a declared rate
+    // the loss-responsive controller stays in charge.
+    if (BandwidthCfg.MaxTx > 0) {
+        QUICConfig.CongestionControl = "brutal";
+        QUICConfig.BrutalRate = BandwidthCfg.MaxTx;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -103,13 +117,18 @@ public:
 };
 
 // ClientUdpIO mirrors udpIOImpl in client/client.go.
+// Holds a shared_ptr to the QUIC connection: an outstanding relay connection
+// (UdpConn) keeps its IO alive, and the IO keeps the connection alive, so a
+// session outliving its Client can still Send/Receive (or fail cleanly)
+// instead of writing through a dangling pointer.
 class ClientUdpIO : public UdpIO {
 public:
-    explicit ClientUdpIO(IQuicConnection& conn) : conn_(conn) {}
+    explicit ClientUdpIO(std::shared_ptr<IQuicConnection> conn)
+        : conn_(std::move(conn)) {}
 
     std::shared_ptr<const proto::UDPMessage> ReceiveMessage() override {
         for (;;) {
-            std::vector<uint8_t> msg = conn_.ReceiveDatagram(); // throws on close
+            std::vector<uint8_t> msg = conn_->ReceiveDatagram(); // throws on close
             try {
                 return std::make_shared<const proto::UDPMessage>(
                     proto::ParseUDPMessage(msg.data(), msg.size()));
@@ -126,11 +145,11 @@ public:
             // Message larger than buffer, silent drop
             return;
         }
-        conn_.SendDatagram(buf, static_cast<size_t>(msgN));
+        conn_->SendDatagram(buf, static_cast<size_t>(msgN));
     }
 
 private:
-    IQuicConnection& conn_;
+    std::shared_ptr<IQuicConnection> conn_;
 };
 
 // ---------------------------------------------------------------------------
@@ -207,8 +226,8 @@ HandshakeInfo ClientImpl::connect(ClientTransport& transport) {
     info.ECHAccepted = false; // ECH is a transport-backend capability
 
     if (authResp.UDPEnabled) {
-        io_ = std::make_shared<ClientUdpIO>(*conn_);
-        udpSM_ = ClientUdpSessionManager::Create(io_.get());
+        io_ = std::make_shared<ClientUdpIO>(conn_);
+        udpSM_ = ClientUdpSessionManager::Create(io_);
     }
     return info;
 }

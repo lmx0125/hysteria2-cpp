@@ -48,6 +48,9 @@ public:
 
     // Exposed for testing / debugging.
     double AckRate() const { return ackRate_; }
+    // Declared fixed send rate (bytes per second); the ngtcp2 backend arms its
+    // in-stack Brutal controller with it.
+    ByteCount BrutalRate() const override { return bps_; }
 
 private:
     struct PktInfo {

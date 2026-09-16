@@ -10,6 +10,7 @@
 #include <thread>
 
 #include "hy2/h3/h3.hpp"
+#include "hy2/congestion_factory.hpp"
 #include "hy2/copy.hpp"
 #include "hy2/error.hpp"
 #include "hy2/varint.hpp"
@@ -65,9 +66,10 @@ static const char* FindHeader(const std::vector<Header>& hs,
 }
 
 HySession::HySession(std::shared_ptr<IQuicConnection> conn,
-                     Authenticator* auth, Outbound* outbound, bool udpEnabled)
+                     Authenticator* auth, Outbound* outbound,
+                     const HySessionConfig& config)
     : conn_(std::move(conn)), auth_(auth), outbound_(outbound),
-      udpEnabled_(udpEnabled) {}
+      config_(config), udpEnabled_(config.udpEnabled) {}
 
 HySession::~HySession() { Stop(); }
 
@@ -157,9 +159,44 @@ bool HySession::Auth() {
         return false;
     }
 
+    // Congestion / bandwidth negotiation, mirroring
+    // core::server::H3sHandler::ServeHTTP:
+    //   - the client's requested download rate (areq.Rx) drives OUR send
+    //     congestion control (Brutal when > 0, else the configured CC),
+    //   - the advertised back-pressure (aresp.Rx) lets the client use
+    //     Brutal for its upload direction.
     AuthResponse aresp;
     aresp.UDPEnabled = udpEnabled_;
-    aresp.Rx = 0; // unlimited
+    aresp.Rx = 0;
+    uint64_t actualTx = 0;
+    if (config_.ignoreClientBandwidth) {
+        hy2::cc::UseConfigured(*conn_, config_.congestionType, config_.bbrProfile);
+    } else {
+        actualTx = areq.Rx;
+        if (config_.bandwidthMaxTx > 0 && actualTx > config_.bandwidthMaxTx) {
+            actualTx = config_.bandwidthMaxTx;
+        }
+        if (actualTx > 0) {
+            hy2::cc::UseBrutal(*conn_, actualTx, config_.disableLossCompensation);
+        } else {
+            hy2::cc::UseConfigured(*conn_, config_.congestionType, config_.bbrProfile);
+        }
+        aresp.Rx = config_.bandwidthMaxRx;
+    }
+    // One line per connection: useful to verify the negotiated CC without
+    // enabling the (very verbose) full protocol tracing.
+    if (!std::getenv("HY2_CC_SILENT")) {
+        std::fprintf(stderr,
+                     "[hy2-server] cc: clientRx=%llu actualTx=%llu arespRx=%llu "
+                     "ignore=%d brutalRequest=%d quic=%s\n",
+                     (unsigned long long)areq.Rx,
+                     (unsigned long long)actualTx,
+                     (unsigned long long)aresp.Rx,
+                     config_.ignoreClientBandwidth ? 1 : 0,
+                     actualTx > 0 ? 1 : 0,
+                     config_.congestionType.c_str());
+    }
+
     HeaderMap rh;
     AuthResponseToHeader(rh, aresp);
     (void)lc;

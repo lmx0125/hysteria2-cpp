@@ -9,6 +9,7 @@
 #include <thread>
 #include <vector>
 
+#include "hy2/copy.hpp"
 #include "hy2/debug_print.hpp"
 
 #ifdef _WIN32
@@ -86,37 +87,6 @@ std::string readLine(server::IConn& conn) {
     return line;
 }
 
-// Bidirectional copy
-void bidirectionalCopy(std::shared_ptr<hy2::IByteReaderWriter> a,
-                       std::shared_ptr<hy2::IByteReaderWriter> b) {
-    std::atomic<bool> done{false};
-    auto copier = [&](std::shared_ptr<hy2::IByteReaderWriter> src,
-                      std::shared_ptr<hy2::IByteReaderWriter> dst) {
-        uint8_t buf[4096];
-        while (!done.load(std::memory_order_relaxed)) {
-            size_t n = src->Read(buf, sizeof(buf));
-            if (n == 0) break;
-            try {
-                dst->Write(buf, n);
-            } catch (...) {
-                break;
-            }
-        }
-        done.store(true, std::memory_order_relaxed);
-        // Unblock the other direction's blocking Read. Without closing the
-        // peer side it stays parked in src->Read() until the remote closes
-        // (which never happens for e.g. HTTP keep-alive), so join() below
-        // would hang forever. Mirrors core CopyTwoWay's closeQuietly teardown.
-        try { a->Close(); } catch (...) {}
-        try { b->Close(); } catch (...) {}
-    };
-
-    std::thread t1(copier, a, b);
-    std::thread t2(copier, b, a);
-    t1.join();
-    t2.join();
-}
-
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -131,7 +101,7 @@ void HttpServer::dispatch(std::shared_ptr<server::IConn> conn) {
             return;
         }
 
-        // Parse "CONNECT host:port HTTP/1.1"
+        // Parse "CONNECT host:port HTTP/1.1" or "GET http://host/path HTTP/1.1"
         auto space1 = requestLine.find(' ');
         auto space2 = requestLine.find(' ', space1 + 1);
         if (space1 == std::string::npos || space2 == std::string::npos) {
@@ -142,16 +112,22 @@ void HttpServer::dispatch(std::shared_ptr<server::IConn> conn) {
         std::string method = requestLine.substr(0, space1);
         std::string target = requestLine.substr(space1 + 1, space2 - space1 - 1);
 
-        // Read headers until empty line
+        // Read all headers until empty line
         std::string authHeader;
+        std::string rawHeaders;
+        size_t contentLength = 0;
         while (true) {
             std::string line = readLine(*conn);
             if (line.empty()) break;
+            rawHeaders += line + "\r\n";
             if (line.substr(0, 20) == "Proxy-Authorization:") {
                 authHeader = line.substr(20);
-                // Trim whitespace
                 size_t start = authHeader.find_first_not_of(" \t");
                 if (start != std::string::npos) authHeader = authHeader.substr(start);
+            }
+            if (line.substr(0, 15) == "Content-Length:") {
+                contentLength = static_cast<size_t>(
+                    std::stoull(line.substr(15)));
             }
         }
 
@@ -159,7 +135,6 @@ void HttpServer::dispatch(std::shared_ptr<server::IConn> conn) {
         if (AuthFunc) {
             auto [user, pass] = parseProxyAuth(authHeader);
             if (!AuthFunc(user, pass)) {
-                // Send 407 Proxy Authentication Required
                 std::string resp = "HTTP/1.1 407 Proxy Authentication Required\r\n"
                                    "Proxy-Authenticate: Basic realm=\"" + AuthRealm + "\"\r\n"
                                    "Content-Length: 0\r\n"
@@ -173,12 +148,8 @@ void HttpServer::dispatch(std::shared_ptr<server::IConn> conn) {
         if (method == "CONNECT") {
             handleConnect(conn, target);
         } else {
-            // Non-CONNECT: not supported by this proxy
-            std::string resp = "HTTP/1.1 400 Bad Request\r\n"
-                               "Content-Length: 0\r\n"
-                               "Connection: close\r\n\r\n";
-            conn->Write(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
-            conn->Close();
+            // Plain HTTP forward proxy: GET/POST/PUT/DELETE/HEAD/OPTIONS etc.
+            handleForward(conn, method, target, rawHeaders, contentLength);
         }
     } catch (...) {
         try { conn->Close(); } catch (...) {}
@@ -214,12 +185,95 @@ bool HttpServer::handleConnect(std::shared_ptr<server::IConn> conn,
 
     // Bidirectional copy
     auto connRw = std::static_pointer_cast<hy2::IByteReaderWriter>(conn);
-    bidirectionalCopy(connRw, rConn);
+    server::CopyTwoWay(connRw, rConn);
 
     if (EventLogger) {
         EventLogger->ConnectError("", targetAddr, "");
     }
     return true;
+}
+
+void HttpServer::handleForward(std::shared_ptr<server::IConn> conn,
+                                const std::string& method,
+                                const std::string& targetUrl,
+                                const std::string& rawHeaders,
+                                size_t contentLength) {
+    if (EventLogger) {
+        EventLogger->HTTPRequest("", method + " " + targetUrl);
+    }
+
+    // Parse targetUrl (e.g. "http://example.com:80/path") to extract host:port
+    std::string dialAddr;
+    std::string path = "/";
+    {
+        // Strip scheme
+        std::string url = targetUrl;
+        auto schemeEnd = url.find("://");
+        if (schemeEnd != std::string::npos) {
+            url = url.substr(schemeEnd + 3);
+        }
+        // Split host and path
+        auto pathStart = url.find('/');
+        std::string hostPart;
+        if (pathStart != std::string::npos) {
+            hostPart = url.substr(0, pathStart);
+            path = url.substr(pathStart);
+        } else {
+            hostPart = url;
+        }
+        // Split host and port
+        auto colonPos = hostPart.rfind(':');
+        if (colonPos != std::string::npos) {
+            dialAddr = hostPart; // already host:port
+        } else {
+            dialAddr = hostPart + ":80"; // default HTTP port
+        }
+    }
+
+    // Dial via Hysteria2 client
+    std::shared_ptr<hy2::IByteReaderWriter> rConn;
+    try {
+        rConn = HyClient->TCP(dialAddr);
+    } catch (...) {
+        std::string resp = "HTTP/1.1 502 Bad Gateway\r\n"
+                           "Content-Length: 0\r\n"
+                           "Connection: close\r\n\r\n";
+        conn->Write(reinterpret_cast<const uint8_t*>(resp.data()), resp.size());
+        if (EventLogger) {
+            EventLogger->HTTPError("", targetUrl, "dial failed");
+        }
+        conn->Close();
+        return;
+    }
+
+    // Rebuild request with path: "GET /path HTTP/1.1\r\nHeaders...\r\n\r\n"
+    std::ostringstream req;
+    req << method << " " << path << " HTTP/1.1\r\n" << rawHeaders << "\r\n";
+
+    std::string reqStr = req.str();
+    rConn->Write(reinterpret_cast<const uint8_t*>(reqStr.data()), reqStr.size());
+
+    // Forward request body if present
+    if (contentLength > 0) {
+        std::vector<uint8_t> body(contentLength);
+        size_t got = 0;
+        while (got < contentLength) {
+            size_t n = conn->Read(body.data() + got, contentLength - got);
+            if (n == 0) break;
+            got += n;
+        }
+        if (got > 0) {
+            rConn->Write(body.data(), got);
+        }
+    }
+
+    // Relay the response back to the client
+    auto connRw = std::static_pointer_cast<hy2::IByteReaderWriter>(conn);
+    server::CopyTwoWay(connRw, rConn);
+
+    if (EventLogger) {
+        EventLogger->HTTPError("", targetUrl, "");
+    }
 }
 
 // ---------------------------------------------------------------------------

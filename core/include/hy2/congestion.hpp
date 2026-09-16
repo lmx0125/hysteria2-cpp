@@ -43,6 +43,11 @@ public:
     virtual bool CanSend(ByteCount bytesInFlight) = 0;
     virtual ByteCount GetCongestionWindow() = 0;
 
+    // Fixed send rate this controller was configured with (bytes per second),
+    // or 0 when it does not run at a fixed rate. The ngtcp2 backend reads it
+    // to arm the equivalent in-stack controller (ngtcp2_conn_set_brutal_rate).
+    virtual ByteCount BrutalRate() const { return 0; }
+
     virtual void OnPacketSent(MonoTime sentTime, ByteCount bytesInFlight,
                               PacketNumber packetNumber, ByteCount bytes,
                               bool isRetransmittable) = 0;

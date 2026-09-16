@@ -1,4 +1,4 @@
-ï»¿// client_udp.cpp - rewrite of core/client/udp.go
+// client_udp.cpp - rewrite of core/client/udp.go
 #include "hy2/client_udp.hpp"
 
 #include <thread>
@@ -8,8 +8,8 @@ namespace hy2::client {
 // ---------------------------------------------------------------------------
 // UdpConn
 
-UdpConn::UdpConn(uint32_t id, UdpIO* io)
-    : ID(id), IO(io),
+UdpConn::UdpConn(uint32_t id, std::shared_ptr<UdpIO> io)
+    : ID(id), IO(std::move(io)),
       ReceiveCh(std::make_shared<Channel<std::shared_ptr<const proto::UDPMessage>>>(
           kUdpMessageChanSize)) {}
 
@@ -17,7 +17,7 @@ bool UdpConn::Receive(std::vector<uint8_t>& data, std::string& addr) {
     for (;;) {
         std::shared_ptr<const proto::UDPMessage> msg;
         if (!ReceiveCh->ReceiveFor(msg, std::chrono::milliseconds(100))) {
-            // Timeout or closed â€” return false so the caller can check its deadline
+            // Timeout or closed ¡ª return false so the caller can check its deadline
             if (ReceiveCh->Closed()) return false;
             return false;
         }
@@ -62,9 +62,10 @@ void UdpConn::Close() { closed_.store(true); }
 // ---------------------------------------------------------------------------
 // ClientUdpSessionManager
 
-ClientUdpSessionManager::ClientUdpSessionManager(UdpIO* io) : io_(io) {}
+ClientUdpSessionManager::ClientUdpSessionManager(std::shared_ptr<UdpIO> io)
+    : io_(std::move(io)) {}
 
-std::shared_ptr<ClientUdpSessionManager> ClientUdpSessionManager::Create(UdpIO* io) {
+std::shared_ptr<ClientUdpSessionManager> ClientUdpSessionManager::Create(std::shared_ptr<UdpIO> io) {
     // Factory so the receive loop can hold shared ownership
     // (shared_from_this() is not usable inside a constructor).
     auto mgr = std::shared_ptr<ClientUdpSessionManager>(new ClientUdpSessionManager(io));

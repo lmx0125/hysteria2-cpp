@@ -21,6 +21,19 @@ struct HyServerParams {
     std::string certPem;
     std::string keyPem;
     bool udpEnabled = true;
+
+    // Congestion / bandwidth negotiation (see HySessionConfig):
+    //   bandwidthMaxTx: cap for server -> client (bytes/s, 0 = unlimited)
+    //   bandwidthMaxRx: advertised client -> server cap (bytes/s, 0 = the
+    //                   client uses its own configured upload bandwidth)
+    //   ignoreClientBandwidth: always use the configured CC instead of
+    //                   honoring the client's requested download rate.
+    bool ignoreClientBandwidth = false;
+    uint64_t bandwidthMaxTx = 0;
+    uint64_t bandwidthMaxRx = 0;
+    std::string congestionType = "bbr";
+    std::string bbrProfile;
+    bool disableLossCompensation = false;
 };
 
 // Session registry shared between HyServer and its detached per-connection

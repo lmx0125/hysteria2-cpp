@@ -20,6 +20,7 @@ std::shared_ptr<IQuicConnection> CreateQuicConnection(
     params.serverName = serverName;
     params.insecureSkipVerify = insecureSkipVerify;
     params.quicCfg = quicCfg;
+    params.localBindAddr = quicCfg.LocalBindAddr;
 
     auto conn = Ngtcp2Connection::Connect(params);
     if (!conn) {

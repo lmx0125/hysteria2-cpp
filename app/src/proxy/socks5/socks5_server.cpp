@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "hy2/copy.hpp"
 #include "hy2/debug_print.hpp"
 
 #ifdef _WIN32
@@ -81,37 +82,6 @@ void sendSimpleReply(server::IConn& conn, uint8_t rep) {
 
 // Parse SOCKS5 address from bytes (implementation in header-declared function)
 
-// Bidirectional copy between two connections
-void bidirectionalCopy(std::shared_ptr<hy2::IByteReaderWriter> a,
-                       std::shared_ptr<hy2::IByteReaderWriter> b) {
-    std::atomic<bool> done{false};
-    auto copier = [&](std::shared_ptr<hy2::IByteReaderWriter> src,
-                      std::shared_ptr<hy2::IByteReaderWriter> dst) {
-        uint8_t buf[4096];
-        while (!done.load(std::memory_order_relaxed)) {
-            size_t n = src->Read(buf, sizeof(buf));
-            if (n == 0) break;
-            try {
-                dst->Write(buf, n);
-            } catch (...) {
-                break;
-            }
-        }
-        done.store(true, std::memory_order_relaxed);
-        // Unblock the other direction's blocking Read. Without closing the
-        // peer side it stays parked in src->Read() until the remote closes
-        // (which never happens for e.g. HTTP keep-alive), so join() below
-        // would hang forever. Mirrors core CopyTwoWay's closeQuietly teardown.
-        try { a->Close(); } catch (...) {}
-        try { b->Close(); } catch (...) {}
-    };
-
-    std::thread t1(copier, a, b);
-    std::thread t2(copier, b, a);
-    t1.join();
-    t2.join();
-}
-
 // Parse a SOCKS5 UDP datagram (RFC 1928).
 // Returns true on success, filling frag, addrStr ("host:port"), and data.
 bool parseSocks5UdpDatagram(const uint8_t* buf, size_t len, uint8_t& frag,
@@ -177,6 +147,52 @@ constexpr socket_t kInvalidSock = -1;
 inline void closeSock(socket_t s) { ::close(s); }
 #endif
 
+// SocketConn - wraps a raw TCP socket as hy2::server::IConn
+class SocketConn : public server::IConn {
+public:
+    explicit SocketConn(socket_t fd) : fd_(fd) {}
+    ~SocketConn() override { Close(); }
+
+    SocketConn(const SocketConn&) = delete;
+    SocketConn& operator=(const SocketConn&) = delete;
+
+    size_t Read(uint8_t* buf, size_t n) override {
+        if (fd_ == kInvalidSock) return 0;
+#ifdef _WIN32
+        int r = recv(fd_, reinterpret_cast<char*>(buf), static_cast<int>(n), 0);
+#else
+        ssize_t r = ::recv(fd_, buf, n, 0);
+#endif
+        if (r <= 0) return 0;
+        return static_cast<size_t>(r);
+    }
+
+    void Write(const uint8_t* buf, size_t n) override {
+        if (fd_ == kInvalidSock) throw std::runtime_error("write on closed socket");
+        size_t off = 0;
+        while (off < n) {
+#ifdef _WIN32
+            int sent = send(fd_, reinterpret_cast<const char*>(buf + off),
+                            static_cast<int>(n - off), 0);
+#else
+            ssize_t sent = ::send(fd_, buf + off, n - off, 0);
+#endif
+            if (sent <= 0) throw std::runtime_error("write failed");
+            off += static_cast<size_t>(sent);
+        }
+    }
+
+    void Close() override {
+        if (fd_ != kInvalidSock) {
+            closeSock(fd_);
+            fd_ = kInvalidSock;
+        }
+    }
+
+private:
+    socket_t fd_;
+};
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -237,14 +253,133 @@ std::vector<uint8_t> buildSocks5Address(const std::string& hostPort) {
 }
 
 // ---------------------------------------------------------------------------
+// TcpListener
+
+TcpListener::~TcpListener() { Close(); }
+
+bool TcpListener::Listen(uint16_t port) {
+#ifdef _WIN32
+    fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd_ == kInvalid) return false;
+    int yes = 1;
+    setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
+#else
+    fd_ = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd_ < 0) return false;
+    int yes = 1;
+    setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
+
+    struct sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(port);
+
+    if (::bind(fd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
+        closeSock(fd_);
+        fd_ = kInvalid;
+        return false;
+    }
+    if (::listen(fd_, SOMAXCONN) < 0) {
+        closeSock(fd_);
+        fd_ = kInvalid;
+        return false;
+    }
+    return true;
+}
+
+std::shared_ptr<server::IConn> TcpListener::Accept() {
+    if (fd_ == kInvalid) return nullptr;
+#ifdef _WIN32
+    SOCKET client = ::accept(fd_, nullptr, nullptr);
+    if (client == INVALID_SOCKET) return nullptr;
+#else
+    int client = ::accept(fd_, nullptr, nullptr);
+    if (client < 0) return nullptr;
+#endif
+    return std::make_shared<SocketConn>(client);
+}
+
+void TcpListener::Close() {
+    if (fd_ != kInvalid) {
+        closeSock(fd_);
+        fd_ = kInvalid;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Socks5Server
 
 void Socks5Server::Serve(std::shared_ptr<server::IConn> listener) {
-    // For a real implementation, this would be a TCP accept loop.
-    // The IConn interface doesn't support accept(), so this is a placeholder.
-    // In practice, the caller would use a real TCP listener and pass
-    // accepted connections to dispatch().
-    (void)listener;
+    // Serve from an already-accepted connection (single connection mode).
+    // For multi-connection mode, use ServeOnPort().
+    dispatch(listener);
+}
+
+bool Socks5Server::ServeOnPort(uint16_t port, std::atomic<bool>& stop) {
+    TcpListener listener;
+    if (!listener.Listen(port)) {
+        return false;
+    }
+
+    while (!stop.load(std::memory_order_relaxed)) {
+        auto conn = listener.Accept();
+        if (!conn) break; // listener closed
+        TrackConn(conn);
+        // Keep the server (and its session counters) alive for the detached
+        // session when the host owns it through a shared_ptr. Hosts that
+        // create the server otherwise (e.g. a stack/unique_ptr instance in
+        // tests) must keep it alive themselves.
+        std::shared_ptr<Socks5Server> self = weak_from_this().lock();
+        Socks5Server* owner = self ? self.get() : this;
+        std::thread([self, owner, conn]() {
+            owner->SessionBegin();
+            struct SessionScope {
+                Socks5Server* s;
+                ~SessionScope() { s->SessionEnd(); }
+            } scope{owner};
+            try {
+                owner->dispatch(conn);
+            } catch (...) {
+                try { conn->Close(); } catch (...) {}
+            }
+        }).detach();
+    }
+
+    listener.Close();
+    return true;
+}
+
+bool Socks5Server::WaitForSessions(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lk(sessionMu_);
+    return sessionCv_.wait_for(lk, timeout, [this] {
+        return activeSessions_.load(std::memory_order_relaxed) == 0;
+    });
+}
+
+void Socks5Server::TrackConn(const std::shared_ptr<server::IConn>& conn) {
+    std::lock_guard<std::mutex> lk(connMu_);
+    conns_.erase(std::remove_if(conns_.begin(), conns_.end(),
+                                [](const std::weak_ptr<server::IConn>& w) {
+                                    return w.expired();
+                                }),
+                 conns_.end());
+    conns_.push_back(conn);
+}
+
+void Socks5Server::CloseSessions() {
+    std::vector<std::shared_ptr<server::IConn>> live;
+    {
+        std::lock_guard<std::mutex> lk(connMu_);
+        for (auto& w : conns_) {
+            if (auto c = w.lock()) live.push_back(c);
+        }
+        conns_.clear();
+    }
+    for (auto& c : live) {
+        try { c->Close(); } catch (...) {}
+    }
 }
 
 void Socks5Server::dispatch(std::shared_ptr<server::IConn> conn) {
@@ -269,20 +404,26 @@ void Socks5Server::dispatch(std::shared_ptr<server::IConn> conn) {
         size_t addrLen = 0;
         if (atyp == kAtypIPv4) {
             addrLen = 4;
+            addrData.resize(addrLen);
+            readExact(*conn, addrData.data(), addrLen);
         } else if (atyp == kAtypIPv6) {
             addrLen = 16;
+            addrData.resize(addrLen);
+            readExact(*conn, addrData.data(), addrLen);
         } else if (atyp == kAtypDomain) {
             uint8_t dlen;
             readExact(*conn, &dlen, 1);
-            addrLen = dlen;
+            // parseSocks5Address expects the domain field as length byte + host,
+            // so keep the length byte at the front of the buffer.
+            addrLen = static_cast<size_t>(dlen) + 1;
+            addrData.resize(addrLen);
+            addrData[0] = dlen;
+            readExact(*conn, addrData.data() + 1, dlen);
         } else {
             sendSimpleReply(*conn, kRepCommandNotSupported);
             conn->Close();
             return;
         }
-
-        addrData.resize(addrLen);
-        readExact(*conn, addrData.data(), addrLen);
 
         uint8_t portBytes[2];
         readExact(*conn, portBytes, 2);
@@ -394,9 +535,9 @@ void Socks5Server::handleTCP(std::shared_ptr<server::IConn> conn,
     // Send success reply
     sendSimpleReply(*conn, kRepSuccess);
 
-    // Bidirectional copy
+    // Bidirectional copy using core CopyTwoWay (TLS buffer pool, 32KB buffers)
     auto connRw = std::static_pointer_cast<hy2::IByteReaderWriter>(conn);
-    bidirectionalCopy(connRw, rConn);
+    server::CopyTwoWay(connRw, rConn);
 
     if (EventLogger) {
         EventLogger->TCPError("", targetAddr, "");

@@ -39,6 +39,11 @@ public:
 private:
     bool handleConnect(std::shared_ptr<server::IConn> conn,
                        const std::string& targetAddr);
+    void handleForward(std::shared_ptr<server::IConn> conn,
+                       const std::string& method,
+                       const std::string& targetAddr,
+                       const std::string& rawHeaders,
+                       size_t contentLength);
 };
 
 // Parse HTTP request line: "METHOD host:port HTTP/1.x"
