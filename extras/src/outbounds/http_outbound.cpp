@@ -156,18 +156,36 @@ private:
 };
 #endif // HY2_OPENSSL_AVAILABLE
 
-// Read line from a raw connection (for HTTP response parsing)
-std::string readLine(server::IConn& conn) {
-    std::string line;
-    char c;
-    while (true) {
-        size_t n = conn.Read(reinterpret_cast<uint8_t*>(&c), 1);
-        if (n == 0) break;
-        if (c == '\n') break;
-        if (c != '\r') line.push_back(c);
+// Buffered line reader over an IConn, for HTTP response parsing.
+// Reading one byte per Read() meant a status line plus headers cost one recv()
+// per byte; this reads a block at a time and scans it.
+class LineReader {
+public:
+    explicit LineReader(server::IConn& conn) : conn_(conn) {}
+
+    // Returns the line without CR/LF; whatever partial line was buffered when
+    // the peer closed otherwise (empty string if it closed immediately).
+    std::string ReadLine() {
+        std::string line;
+        for (;;) {
+            while (pos_ < filled_) {
+                const char c = static_cast<char>(buf_[pos_++]);
+                if (c == '\n') return line;
+                if (c != '\r') line.push_back(c);
+            }
+            const size_t n = conn_.Read(buf_, sizeof(buf_));
+            if (n == 0) return line; // EOF
+            filled_ = n;
+            pos_ = 0;
+        }
     }
-    return line;
-}
+
+private:
+    server::IConn& conn_;
+    uint8_t buf_[4096];
+    size_t pos_ = 0;
+    size_t filled_ = 0;
+};
 
 // Connect to proxy
 int dialProxy(const std::string& addr) {
@@ -265,7 +283,8 @@ std::shared_ptr<server::IConn> HttpOutbound::TCP(const std::string& reqAddr) {
     conn->Write(reinterpret_cast<const uint8_t*>(req.data()), req.size());
 
     // Read response status line
-    std::string statusLine = readLine(*conn);
+    LineReader reader(*conn);
+    std::string statusLine = reader.ReadLine();
     if (statusLine.empty()) {
         conn->Close();
         throw std::runtime_error("HTTP outbound: no response from proxy");
@@ -280,7 +299,7 @@ std::shared_ptr<server::IConn> HttpOutbound::TCP(const std::string& reqAddr) {
 
     // Read remaining headers until empty line
     while (true) {
-        std::string line = readLine(*conn);
+        std::string line = reader.ReadLine();
         if (line.empty()) break;
     }
 

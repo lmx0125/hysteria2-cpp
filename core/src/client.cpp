@@ -126,11 +126,11 @@ public:
     explicit ClientUdpIO(std::shared_ptr<IQuicConnection> conn)
         : conn_(std::move(conn)) {}
 
-    std::shared_ptr<const proto::UDPMessage> ReceiveMessage() override {
+    std::shared_ptr<proto::UDPMessage> ReceiveMessage() override {
         for (;;) {
             std::vector<uint8_t> msg = conn_->ReceiveDatagram(); // throws on close
             try {
-                return std::make_shared<const proto::UDPMessage>(
+                return std::make_shared<proto::UDPMessage>(
                     proto::ParseUDPMessage(msg.data(), msg.size()));
             } catch (const Error&) {
                 // Invalid message, this is fine - just wait for the next
@@ -166,6 +166,20 @@ public:
     std::shared_ptr<IByteReaderWriter> TCP(const std::string& addr) override;
     std::shared_ptr<HyUDPConn> UDP() override;
     void Close() override;
+    QuicStatsSnapshot Stats() const override;
+
+    // Throws ClosedError when the connection is gone.
+    //
+    // A connection that hit the QUIC idle timeout - or that the peer closed - is
+    // neither null nor guaranteed to fail the next call: it just stops carrying
+    // data. With only the null check, callers kept using a dead connection
+    // indefinitely. ClosedError is what both reconnect layers above are keyed
+    // on: ReconnectableClientImpl::clientDo drops its client and redials on the
+    // next call, and HyClientPool::MarkDead() re-queues the slot for the pool's
+    // own reconnect worker.
+    void EnsureOpen() const {
+        if (!conn_ || conn_->IsClosed()) throw ClosedError();
+    }
 
     Config config_;
     std::shared_ptr<IQuicConnection> conn_;
@@ -233,9 +247,8 @@ HandshakeInfo ClientImpl::connect(ClientTransport& transport) {
 }
 
 std::shared_ptr<IByteReaderWriter> ClientImpl::TCP(const std::string& addr) {
-    if (!conn_) {
-        throw ClosedError();
-    }
+    EnsureOpen();
+    static const bool diag = std::getenv("HY2_DIAG") != nullptr;
     std::shared_ptr<IQuicStream> stream;
     try {
         stream = conn_->OpenStream();
@@ -246,7 +259,15 @@ std::shared_ptr<IByteReaderWriter> ClientImpl::TCP(const std::string& addr) {
 
     // Send request
     try {
+        if (diag) {
+            std::fprintf(stderr, "[client] TCP %s: stream open, writing request\n", addr.c_str());
+            std::fflush(stderr);
+        }
         proto::WriteTCPRequest(*qStream, addr);
+        if (diag) {
+            std::fprintf(stderr, "[client] TCP %s: request sent, waiting response\n", addr.c_str());
+            std::fflush(stderr);
+        }
     } catch (const std::exception& e) {
         qStream->Close();
         rewrapError(e);
@@ -272,6 +293,10 @@ std::shared_ptr<IByteReaderWriter> ClientImpl::TCP(const std::string& addr) {
             qStream->Close();
             throw DialError(resp.Message);
         }
+        if (diag) {
+            std::fprintf(stderr, "[client] TCP %s: response OK\n", addr.c_str());
+            std::fflush(stderr);
+        }
         tc->Established = true;
     } catch (const DialError&) {
         throw;
@@ -283,6 +308,11 @@ std::shared_ptr<IByteReaderWriter> ClientImpl::TCP(const std::string& addr) {
 }
 
 std::shared_ptr<HyUDPConn> ClientImpl::UDP() {
+    // The data path the TUN feeds, so this is the check that matters most: an
+    // idle-closed connection used to hand out a fresh UdpConn here, and the
+    // packets went into a socket nobody was reading - no exception, so no
+    // reconnect, forever.
+    EnsureOpen();
     if (!udpSM_) {
         throw DialError("UDP not enabled");
     }
@@ -296,6 +326,11 @@ void ClientImpl::Close() {
         } catch (...) {
         }
     }
+}
+
+QuicStatsSnapshot ClientImpl::Stats() const {
+    if (!conn_) return {};
+    return conn_->GetStatsSnapshot();
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +406,14 @@ public:
         }
     }
 
+    // Forward the live connection's counters. A pool measuring a slot must see
+    // the connection that is up *now*, not whichever one it started with - the
+    // inner client is replaced on every reconnect.
+    QuicStatsSnapshot Stats() const override {
+        std::lock_guard<std::mutex> lk(m_);
+        return client_ ? client_->Stats() : QuicStatsSnapshot{};
+    }
+
 private:
     void reconnect() {
         if (client_) {
@@ -422,7 +465,7 @@ private:
     ConnectedCallback connectedFunc_;
     std::shared_ptr<Client> client_;
     int count_ = 0;
-    std::mutex m_;
+    mutable std::mutex m_;
     bool closed_ = false; // permanent close
 };
 

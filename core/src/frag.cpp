@@ -37,24 +37,27 @@ std::vector<proto::UDPMessage> FragUDPMessage(const proto::UDPMessage& m, size_t
     return frags;
 }
 
-std::shared_ptr<const proto::UDPMessage> Defragger::Feed(const proto::UDPMessage& m) {
-    if (m.FragCount <= 1) {
-        return std::make_shared<const proto::UDPMessage>(m);
+std::shared_ptr<proto::UDPMessage> Defragger::Feed(std::shared_ptr<proto::UDPMessage> m) {
+    if (!m) return nullptr;
+    if (m->FragCount <= 1) {
+        // Common case (no fragmentation): pass the caller's object through
+        // untouched. Used to copy the whole message here.
+        return m;
     }
-    if (m.FragID >= m.FragCount) {
+    if (m->FragID >= m->FragCount) {
         return nullptr;
     }
-    if (m.PacketID != pktID_ || frags_.size() != m.FragCount) {
+    if (m->PacketID != pktID_ || frags_.size() != m->FragCount) {
         // new message, clear previous state
-        pktID_ = m.PacketID;
-        frags_.assign(m.FragCount, nullptr);
-        frags_[m.FragID] = std::make_shared<const proto::UDPMessage>(m);
+        pktID_ = m->PacketID;
+        size_ = m->Data.size();
+        frags_.assign(m->FragCount, nullptr);
+        frags_[m->FragID] = std::move(m);
         count_ = 1;
-        size_ = m.Data.size();
-    } else if (!frags_[m.FragID]) {
-        frags_[m.FragID] = std::make_shared<const proto::UDPMessage>(m);
+    } else if (!frags_[m->FragID]) {
+        size_ += m->Data.size();
+        frags_[m->FragID] = std::move(m);
         count_++;
-        size_ += m.Data.size();
         if (count_ == frags_.size()) {
             // all fragments received, assemble into a new message
             auto assembled = std::make_shared<proto::UDPMessage>();

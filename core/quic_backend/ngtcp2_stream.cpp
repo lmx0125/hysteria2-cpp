@@ -1,36 +1,80 @@
 #include "hy2/quic_backend/ngtcp2_stream.hpp"
+#include "hy2/diag/lock_diag.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 
 #include "hy2/debug_print.hpp"
+#include "hy2/diag/lock_diag.hpp"
 #include "hy2/quic_backend/ngtcp2_connection.hpp"
+#include "hy2/diag/lock_diag.hpp"
 
 namespace hy2::quic_backend {
 
-Ngtcp2Stream::Ngtcp2Stream(Ngtcp2Connection* conn, int64_t streamId)
-    : conn_(conn), streamId_(streamId) {}
+namespace {
+// Runtime-gated stream diagnostics (HY2_DIAG=1): per-second byte counts for
+// writes/reads plus the state at a stall (pending/unacked vs buffered), so a
+// single run shows which side stopped moving.
+bool StreamDiagOn() {
+    static const bool on = std::getenv("HY2_DIAG") != nullptr;
+    return on;
+}
+void StreamDiag(const char* what, int64_t sid, size_t n, uint64_t a, uint64_t b) {
+    if (!StreamDiagOn()) return;
+    static std::mutex mu;
+    static uint64_t calls = 0, bytes = 0;
+    static int64_t nextMs = 0;
+    std::lock_guard<std::mutex> lk(mu);
+    bytes += n;
+    ++calls;
+    const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (nowMs >= nextMs) {
+        std::fprintf(stderr, "[stream] %s sid=%lld calls=%llu bytes=%llu last=%zu a=%llu b=%llu\n",
+                     what, (long long)sid, (unsigned long long)calls,
+                     (unsigned long long)bytes, n, (unsigned long long)a,
+                     (unsigned long long)b);
+        std::fflush(stderr);
+        calls = 0;
+        bytes = 0;
+        nextMs = nowMs + 1000;
+    }
+}
+}  // namespace
+
+Ngtcp2Stream::Ngtcp2Stream(std::shared_ptr<Ngtcp2Connection> conn, int64_t streamId)
+    : conn_(std::move(conn)), streamId_(streamId) {}
 
 Ngtcp2Stream::~Ngtcp2Stream() {
     // Never call back into the connection here: destruction can happen
     // inside ngtcp2 callbacks where driving would re-enter packet
     // encoding (PPE) - just release condition variables.
     {
-        std::lock_guard<std::mutex> lk(readMu_);
+        hy2::diag::LockTimer _hy2lt_20("ngtcp2_stream:20 readMu_");
+          std::lock_guard<std::mutex> lk(readMu_);
+          _hy2lt_20.done();
         readClosed_ = true;
         readEof_ = true;
         readCv_.notify_all();
     }
     {
-        std::lock_guard<std::mutex> lk(writeMu_);
+        hy2::diag::LockTimer _hy2lt_26("ngtcp2_stream:26 writeMu_");
+          std::lock_guard<std::mutex> lk(writeMu_);
+          _hy2lt_26.done();
         writeClosed_ = true;
         writeCv_.notify_all();
     }
 }
 
 size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
-    std::unique_lock<std::mutex> lk(readMu_);
+    hy2::diag::LockTimer _hy2lt_33("ngtcp2_stream:33 readMu_");
+      std::unique_lock<std::mutex> lk(readMu_);
+      _hy2lt_33.done();
 
     // Wait for data or EOF — support deadline for timeout
     auto pred = [this] {
@@ -52,8 +96,17 @@ size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
             if (pred()) break;
         }
     } else {
-        readCv_.wait(lk, pred);
+        // Bounded wait: read notifications are batched (one wakeup per
+        // received-packet batch), so a single missed notify used to park this
+        // reader forever - after a traffic burst (e.g. seeking in a video) the
+        // connection stopped delivering data with no way to recover. The
+        // 100 ms tick bounds a lost wakeup to one tick; an idle stream just
+        // re-checks its predicate a few times per second.
+        while (!pred()) {
+            readCv_.wait_for(lk, std::chrono::milliseconds(100));
+        }
     }
+
 
     if (readPos_ >= readBuf_.size()) {
         return 0; // EOF
@@ -63,6 +116,8 @@ size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
     size_t toRead = std::min(n, avail);
     std::memcpy(p, readBuf_.data() + readPos_, toRead);
     readPos_ += toRead;
+    StreamDiag("read", streamId_, toRead, static_cast<uint64_t>(readBuf_.size()),
+               static_cast<uint64_t>(readPos_));
 
     // Compact buffer when fully consumed
     if (readPos_ >= readBuf_.size()) {
@@ -70,11 +125,33 @@ size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
         readPos_ = 0;
     }
 
+    // Return flow-control credit for the consumed bytes. Consumption (not
+    // arrival) drives the window, so the peer can never be more than the
+    // initial receive window ahead of the application and readBuf_ stays
+    // bounded. Batched to keep the per-read connection-lock traffic low.
+    // The readMu_ lock MUST be released before calling into the connection:
+    // the receive path holds opMu_ and then readMu_ (OnStreamData), so
+    // readMu_ -> opMu_ here would be an ABBA deadlock.
+    uint64_t credit = 0;
+    recvCreditPending_ += toRead;
+    if (recvCreditPending_ >= kRecvCreditBatch) {
+        credit = recvCreditPending_;
+        recvCreditPending_ = 0;
+    }
+    lk.unlock();
+    if (credit > 0) {
+        // Weak lock: a stream the application kept past the connection's
+        // lifetime must not touch the freed connection (see conn_ comment).
+        if (auto c = conn_.lock()) c->ExtendReadCredit(streamId_, credit);
+    }
+
     return toRead;
 }
 
 void Ngtcp2Stream::Write(const uint8_t* p, size_t n) {
-    std::unique_lock<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_86("ngtcp2_stream:86 writeMu_");
+      std::unique_lock<std::mutex> lk(writeMu_);
+      _hy2lt_86.done();
     if (writeClosed_) {
         DBG_LOG("Ngtcp2Stream::Write: write side closed, stream_id", streamId_);
         throw hy2::Error("write side closed");
@@ -98,14 +175,18 @@ void Ngtcp2Stream::Write(const uint8_t* p, size_t n) {
     // Wake the event-loop thread so it flushes pending data immediately.
     // Edge-triggered: repeated writes inside one burst only pay the pipe
     // syscall once per false->true transition of the pending flag.
-    if (conn_) conn_->WakeUpOnData();
+    if (auto c = conn_.lock()) c->WakeUpOnData();
+    StreamDiag("write", streamId_, n, tailOffset_ - ackedOffset_,
+               static_cast<uint64_t>(writeChunks_.size()));
 }
 
 void Ngtcp2Stream::Close() {
     // QUIC semantics: this is a HALF-CLOSE (shutdown of the write side).
     // The read side remains usable until the peer sends its own FIN.
     {
-        std::lock_guard<std::mutex> lk(writeMu_);
+        hy2::diag::LockTimer _hy2lt_117("ngtcp2_stream:117 writeMu_");
+          std::lock_guard<std::mutex> lk(writeMu_);
+          _hy2lt_117.done();
         if (!writeClosed_) {
             writeClosed_ = true;
             finPending_ = true; // send FIN with the last data
@@ -117,7 +198,9 @@ void Ngtcp2Stream::Close() {
 void Ngtcp2Stream::CancelRead(StreamErrorCode code) {
     (void)code;
     {
-        std::lock_guard<std::mutex> lk(readMu_);
+        hy2::diag::LockTimer _hy2lt_129("ngtcp2_stream:129 readMu_");
+          std::lock_guard<std::mutex> lk(readMu_);
+          _hy2lt_129.done();
         readClosed_ = true;
     }
     readCv_.notify_all();
@@ -126,7 +209,9 @@ void Ngtcp2Stream::CancelRead(StreamErrorCode code) {
 void Ngtcp2Stream::CancelWrite(StreamErrorCode code) {
     (void)code;
     {
-        std::lock_guard<std::mutex> lk(writeMu_);
+        hy2::diag::LockTimer _hy2lt_138("ngtcp2_stream:138 writeMu_");
+          std::lock_guard<std::mutex> lk(writeMu_);
+          _hy2lt_138.done();
         writeClosed_ = true;
         finPending_ = false;
     }
@@ -138,7 +223,9 @@ uint64_t Ngtcp2Stream::StreamID() const {
 }
 
 void Ngtcp2Stream::OnStreamData(const uint8_t* data, size_t len, bool fin) {
-    std::lock_guard<std::mutex> lk(readMu_);
+    hy2::diag::LockTimer _hy2lt_150("ngtcp2_stream:150 readMu_");
+      std::lock_guard<std::mutex> lk(readMu_);
+      _hy2lt_150.done();
     if (len > 0) {
         readBuf_.insert(readBuf_.end(), data, data + len);
     }
@@ -152,7 +239,9 @@ void Ngtcp2Stream::OnStreamData(const uint8_t* data, size_t len, bool fin) {
 void Ngtcp2Stream::FlushReadNotify() {
     bool need = false;
     {
-        std::lock_guard<std::mutex> lk(readMu_);
+        hy2::diag::LockTimer _hy2lt_164("ngtcp2_stream:164 readMu_");
+          std::lock_guard<std::mutex> lk(readMu_);
+          _hy2lt_164.done();
         if (readDirty_) {
             readDirty_ = false;
             need = true;
@@ -165,12 +254,16 @@ void Ngtcp2Stream::FlushReadNotify() {
 
 void Ngtcp2Stream::OnStreamClose(uint64_t /*appErrorCode*/) {
     {
-        std::lock_guard<std::mutex> lk(readMu_);
+        hy2::diag::LockTimer _hy2lt_177("ngtcp2_stream:177 readMu_");
+          std::lock_guard<std::mutex> lk(readMu_);
+          _hy2lt_177.done();
         readEof_ = true;
         readCv_.notify_all();
     }
     {
-        std::lock_guard<std::mutex> lk(writeMu_);
+        hy2::diag::LockTimer _hy2lt_182("ngtcp2_stream:182 writeMu_");
+          std::lock_guard<std::mutex> lk(writeMu_);
+          _hy2lt_182.done();
         writeClosed_ = true;
         writeCv_.notify_all();
     }
@@ -181,7 +274,9 @@ void Ngtcp2Stream::OnStreamReset(uint64_t /*finalSize*/, uint64_t appErrorCode) 
 }
 
 void Ngtcp2Stream::OnAckedStreamData(uint64_t offset, uint64_t datalen) {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_193("ngtcp2_stream:193 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_193.done();
     // ngtcp2 reports the largest *gap-free* acked offset, i.e. everything
     // below it is safe to release (retransmissions can no longer need it).
     const uint64_t acked = offset + datalen;
@@ -225,7 +320,9 @@ void Ngtcp2Stream::AppendWriteLocked(const uint8_t* p, size_t n) {
 }
 
 const uint8_t* Ngtcp2Stream::PeekPendingWrite(size_t* len, bool* fin) {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_237("ngtcp2_stream:237 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_237.done();
     *fin = finPending_;
     if (sentOffset_ >= tailOffset_ || writeChunks_.empty()) {
         *len = 0;
@@ -248,18 +345,24 @@ const uint8_t* Ngtcp2Stream::PeekPendingWrite(size_t* len, bool* fin) {
 }
 
 bool Ngtcp2Stream::HasPendingWrite() const {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_260("ngtcp2_stream:260 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_260.done();
     // Note: a locally-closed stream still needs to flush queued data + FIN.
     return sentOffset_ < tailOffset_ || finPending_;
 }
 
 bool Ngtcp2Stream::FinPending() const {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_266("ngtcp2_stream:266 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_266.done();
     return finPending_;
 }
 
 void Ngtcp2Stream::AdvanceWrite(size_t n) {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_271("ngtcp2_stream:271 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_271.done();
     // Only move the send cursor: the bytes stay buffered until the peer acks
     // them, because ngtcp2 re-reads them for retransmissions. Freeing happens
     // in OnAckedStreamData()/DropAckedLocked().
@@ -271,17 +374,35 @@ void Ngtcp2Stream::AdvanceWrite(size_t n) {
 }
 
 void Ngtcp2Stream::ClearFinPending() {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_283("ngtcp2_stream:283 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_283.done();
     finPending_ = false;
 }
 
 void Ngtcp2Stream::SetFinPending() {
-    std::lock_guard<std::mutex> lk(writeMu_);
+    hy2::diag::LockTimer _hy2lt_288("ngtcp2_stream:288 writeMu_");
+      std::lock_guard<std::mutex> lk(writeMu_);
+      _hy2lt_288.done();
     finPending_ = true;
 }
 
 bool Ngtcp2Stream::IsClosed() const {
     return closed_;
+}
+
+void Ngtcp2Stream::DiagPrint() {
+    std::unique_lock<std::mutex> rl(readMu_, std::try_to_lock);
+    std::unique_lock<std::mutex> wl(writeMu_, std::try_to_lock);
+    std::fprintf(stderr,
+                 "[hb-stream] sid=%lld read=%s buf=%zu pos=%zu eof=%d dirty=%d rclosed=%d | "
+                 "write=%s tail=%llu sent=%llu acked=%llu chunks=%zu cursor=%zu fin=%d wclosed=%d\n",
+                 (long long)streamId_, rl.owns_lock() ? "ok" : "LOCKED",
+                 readBuf_.size(), readPos_, (int)readEof_, (int)readDirty_, (int)readClosed_,
+                 wl.owns_lock() ? "ok" : "LOCKED", (unsigned long long)tailOffset_,
+                 (unsigned long long)sentOffset_, (unsigned long long)ackedOffset_,
+                 writeChunks_.size(), cursor_, (int)finPending_, (int)writeClosed_);
+    std::fflush(stderr);
 }
 
 } // namespace hy2::quic_backend

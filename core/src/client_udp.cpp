@@ -10,24 +10,26 @@ namespace hy2::client {
 
 UdpConn::UdpConn(uint32_t id, std::shared_ptr<UdpIO> io)
     : ID(id), IO(std::move(io)),
-      ReceiveCh(std::make_shared<Channel<std::shared_ptr<const proto::UDPMessage>>>(
+      ReceiveCh(std::make_shared<Channel<std::shared_ptr<proto::UDPMessage>>>(
           kUdpMessageChanSize)) {}
 
 bool UdpConn::Receive(std::vector<uint8_t>& data, std::string& addr) {
     for (;;) {
-        std::shared_ptr<const proto::UDPMessage> msg;
+        std::shared_ptr<proto::UDPMessage> msg;
         if (!ReceiveCh->ReceiveFor(msg, std::chrono::milliseconds(100))) {
-            // Timeout or closed ¡ª return false so the caller can check its deadline
+            // Timeout or closed ï¿½ï¿½ return false so the caller can check its deadline
             if (ReceiveCh->Closed()) return false;
             return false;
         }
-        auto dfMsg = D.Feed(*msg);
+        auto dfMsg = D.Feed(std::move(msg));
         if (!dfMsg) {
             // Incomplete message, wait for more
             continue;
         }
-        data = dfMsg->Data;
-        addr = dfMsg->Addr;
+        // Sole owner (the channel handed us its only reference): move the
+        // payload out instead of copying it into the caller's buffers (H4/M6).
+        data = std::move(dfMsg->Data);
+        addr = std::move(dfMsg->Addr);
         return true;
     }
 }
@@ -36,15 +38,17 @@ void UdpConn::Send(const uint8_t* data, size_t n, const std::string& addr) {
     if (closed_.load()) {
         throw Error("connection closed");
     }
-    // Try no frag first
-    proto::UDPMessage msg;
+    // Reused across calls on this thread (one UdpConn writer thread, and
+    // possibly several UdpConns on it): no per-datagram allocation for the
+    // message payload or the serialization buffer after the first call.
+    thread_local proto::UDPMessage msg;
+    thread_local std::vector<uint8_t> sendBuf(proto::kMaxUDPSize);
     msg.SessionID = ID;
     msg.PacketID = 0;
     msg.FragID = 0;
     msg.FragCount = 1;
     msg.Addr = addr;
     msg.Data.assign(data, data + n);
-    std::vector<uint8_t> sendBuf(proto::kMaxUDPSize);
     try {
         IO->SendMessage(sendBuf.data(), sendBuf.size(), msg);
     } catch (const DatagramTooLargeError& e) {
@@ -107,7 +111,7 @@ void ClientUdpSessionManager::closeCleanup() {
     closed_ = true;
 }
 
-void ClientUdpSessionManager::feed(std::shared_ptr<const proto::UDPMessage> msg) {
+void ClientUdpSessionManager::feed(std::shared_ptr<proto::UDPMessage> msg) {
     std::shared_lock<std::shared_mutex> lk(mutex_);
 
     auto it = m_.find(msg->SessionID);

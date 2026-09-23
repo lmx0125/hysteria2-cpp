@@ -233,15 +233,40 @@ void Ngtcp2Listener::NotifyHandshakeComplete(std::shared_ptr<IQuicConnection> co
 
 static uint64_t AddrKey(const struct sockaddr* addr, socklen_t len) {
     uint8_t buf[sizeof(sockaddr_storage) + sizeof(len)] = {};
-    memcpy(buf, addr, len);
-    memcpy(buf + len, &len, sizeof(len));
+    size_t n = static_cast<size_t>(len);
+    if (n > sizeof(sockaddr_storage)) n = sizeof(sockaddr_storage);
+    memcpy(buf, addr, n);
+
+    // Only hash the bytes that can actually vary. A sockaddr_in is 16 bytes
+    // but just 8 are meaningful (family + port + address); the trailing
+    // sin_zero padding is always zero, and for IPv6 the flowinfo/scope_id tail
+    // is zero too. The old version hashed the full zero-filled 132-byte scratch
+    // buffer, so every inbound server packet paid ~130 dependent multiplies
+    // over constant padding. Dropping constant trailing bytes from FNV-1a does
+    // not weaken it - the avalanche comes from the varying bytes - so this
+    // keeps the same collision behaviour for real addresses.
+    size_t meaningful = n;
+    if (addr->sa_family == AF_INET && n >= sizeof(struct sockaddr_in)) {
+        // family + port + address; sin_zero is padding.
+        meaningful = offsetof(struct sockaddr_in, sin_zero);
+    } else if (addr->sa_family == AF_INET6 && n >= sizeof(struct sockaddr_in6)) {
+        // family + port + flowinfo + address; sin6_scope_id is the zero tail.
+        // The address itself MUST stay covered, or distinct peers collide.
+        meaningful = offsetof(struct sockaddr_in6, sin6_scope_id);
+    }
+    memcpy(buf + meaningful, &len, sizeof(len));
+
     // FNV-1a
     uint64_t h = 1469598103934665603ull;
-    for (uint8_t b : buf) {
-        h ^= b;
+    for (size_t i = 0; i < meaningful + sizeof(len); ++i) {
+        h ^= buf[i];
         h *= 1099511628211ull;
     }
     return h;
+}
+
+uint64_t AddrKeyForTest(const struct sockaddr* addr, socklen_t len) {
+    return AddrKey(addr, len);
 }
 
 void Ngtcp2Listener::HandlePacket(const uint8_t* data, size_t len,
@@ -350,8 +375,15 @@ void Ngtcp2Listener::RecvLoop() {
         local.ss_family = AF_INET;
     }
 
+    // Cached once: the per-iteration getenv() was a linear scan of the
+    // process environment on every wakeup (M4).
+    static const bool bwDiag = std::getenv("HY2_BW_DIAG") != nullptr;
+    // Throttle for the closed-connection sweep: the full conns_ scan under
+    // connsMu_ used to run every loop iteration (M3).
+    auto lastCleanup = std::chrono::steady_clock::now();
+
     while (running_) {
-        if (std::getenv("HY2_BW_DIAG")) {
+        if (bwDiag) {
             static auto diagT = std::chrono::steady_clock::now();
             auto now = std::chrono::steady_clock::now();
             if (now - diagT >= std::chrono::seconds(1)) {
@@ -408,18 +440,24 @@ void Ngtcp2Listener::RecvLoop() {
         // Timers + flushes run on each connection's own worker loop
         // (Ngtcp2Connection::ServerLoop) - nothing to drive here.
 
-        // Drop closed connections periodically.
+        // Drop closed connections periodically (once per second), not on
+        // every wakeup: the scan holds connsMu_, which HandlePacket also
+        // needs for every datagram.
         {
-            std::lock_guard<std::mutex> lk(connsMu_);
-            for (auto it = conns_.begin(); it != conns_.end();) {
-                if (it->second.use_count() <= 1 && it->second->IsHandshakeComplete()) {
-                    DBG_LOG("[RecvLoop] DROPPING connection", "use_count", it->second.use_count(), "key", it->first);
-                    it = conns_.erase(it);
-                } else {
-                    ++it;
+            const auto nowLoop = std::chrono::steady_clock::now();
+            if (nowLoop - lastCleanup >= std::chrono::seconds(1)) {
+                lastCleanup = nowLoop;
+                std::lock_guard<std::mutex> lk(connsMu_);
+                for (auto it = conns_.begin(); it != conns_.end();) {
+                    if (it->second.use_count() <= 1 && it->second->IsHandshakeComplete()) {
+                        DBG_LOG("[RecvLoop] DROPPING connection", "use_count", it->second.use_count(), "key", it->first);
+                        it = conns_.erase(it);
+                    } else {
+                        ++it;
+                    }
                 }
+                DBG_LOG("[RecvLoop] conns_ size after cleanup", conns_.size());
             }
-            DBG_LOG("[RecvLoop] conns_ size after cleanup", conns_.size());
         }
     }
 }
@@ -476,6 +514,11 @@ void Ngtcp2Listener::Close() {
         }
         for (auto& c : conns) {
             c->StopServerLoop();
+            // This listener's socket, wake pipe and SSL context die with it,
+            // while a connection can be kept alive by the server handler (and
+            // its detached stream workers). Clear the non-owning pointers now
+            // so a late Stream::Write() cannot send through freed handles.
+            c->DetachFromListener();
         }
     }
 

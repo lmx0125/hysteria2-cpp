@@ -1,4 +1,4 @@
-﻿// server_udp.hpp - Server UDP session manager. Rewrite of core/server/udp.go.
+// server_udp.hpp - Server UDP session manager. Rewrite of core/server/udp.go.
 #pragma once
 
 #include <functional>
@@ -72,7 +72,7 @@ public:
     // Feed feeds a UDP message to the session. Returns bytes written to the
     // session's UDP connection when a complete message is available, else 0.
     // Throws on send/dial errors (mirrors returned error in Go).
-    size_t Feed(std::shared_ptr<const proto::UDPMessage> msg);
+    size_t Feed(std::shared_ptr<proto::UDPMessage> msg);
 
     // Joins the receive-loop thread (blocks until it exits). Used by
     // UdpSessionManager::Stop for deterministic shutdown; safe because the

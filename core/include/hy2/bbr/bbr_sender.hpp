@@ -212,7 +212,6 @@ private:
 
     Clock& clock_;
     cc::RTTStatsProvider* rttStats_ = nullptr;
-    cc::Pacer pacer_;
 
     BbrMode mode_;
 
@@ -344,6 +343,14 @@ private:
     ByteCount bytesInFlight_ = 0;
 
     bool debug_ = false;
+
+    // DECLARATION ORDER MATTERS: Pacer's constructor immediately queries the
+    // bandwidth callback (BandwidthForPacer -> PacingRate -> pacingRate_ /
+    // highGain_ / initialCongestionWindow_ / minRtt_ / maxDatagramSize_), so
+    // pacer_ must be constructed LAST, after every member it reads. Keep it at
+    // the end of this list (and last in the constructor's init list) - see the
+    // same note in brutal.hpp, which hit this first.
+    cc::Pacer pacer_;
 };
 
 } // namespace hy2::bbr

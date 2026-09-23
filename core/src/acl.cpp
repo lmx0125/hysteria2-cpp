@@ -16,15 +16,29 @@ static int HexDigit(char c) {
 }
 
 // Parse dotted-decimal IPv4 string into 4 bytes. Returns false on error.
+//
+// Hand-rolled rather than istringstream + stoi: each of those constructs a
+// locale-bearing stream object and allocates a token string, and this runs for
+// every IP/CIDR ACL rule on every connection. The acceptance rules are
+// unchanged, including the lenient handling of a trailing ".5".
 static bool ParseIPv4Bytes(const std::string& s, uint8_t out[4]) {
-    std::istringstream iss(s);
+    size_t pos = 0;
     for (int i = 0; i < 4; ++i) {
-        std::string token;
-        if (!std::getline(iss, token, '.')) return false;
-        if (token.empty() || token.size() > 3) return false;
-        for (char c : token) { if (!std::isdigit((unsigned char)c)) return false; }
-        int val = std::stoi(token);
-        if (val < 0 || val > 255) return false;
+        if (i > 0) {
+            if (pos >= s.size() || s[pos] != '.') return false;
+            ++pos;
+        }
+        const size_t start = pos;
+        int val = 0;
+        while (pos < s.size() && s[pos] != '.') {
+            const char c = s[pos];
+            if (c < '0' || c > '9') return false;
+            val = val * 10 + (c - '0');
+            ++pos;
+            if (pos - start > 3) return false;
+        }
+        if (pos == start) return false; // empty token
+        if (val > 255) return false;
         out[i] = static_cast<uint8_t>(val);
     }
     return true;

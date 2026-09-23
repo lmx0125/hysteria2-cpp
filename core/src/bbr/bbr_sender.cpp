@@ -147,7 +147,6 @@ BbrSender::BbrSender(Clock& clock, ByteCount initialMaxDatagramSize,
                      ByteCount initialCongestionWindow, ByteCount initialMaxCongestionWindow,
                      const Profile& profile)
     : clock_(clock),
-      pacer_([this]() -> ByteCount { return BandwidthForPacer(); }),
       mode_(BbrMode::kStartup),
       sampler_(kBandwidthWindowSize),
       lastSentPacket_(kInvalidPacketNumber),
@@ -173,7 +172,9 @@ BbrSender::BbrSender(Clock& clock, ByteCount initialMaxDatagramSize,
       cwndToCalculateMinPacingRate_(initialCongestionWindow),
       maxCongestionWindowWithNetworkParametersAdjusted_(initialMaxCongestionWindow),
       maxDatagramSize_(initialMaxDatagramSize),
-      debug_(envDebugEnabled()) {
+      debug_(envDebugEnabled()),
+      // Last: Pacer's constructor reads the members above (see bbr_sender.hpp).
+      pacer_([this]() -> ByteCount { return BandwidthForPacer(); }) {
     ApplyProfile(profile);
     if (debug_) {
         DebugPrint("Profile: " + profile_);

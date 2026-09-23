@@ -158,7 +158,23 @@ if(HY2_WITH_QUIC_BACKEND)
         GIT_TAG        v1.25.0
         GIT_SHALLOW    TRUE
     )
-    FetchContent_MakeAvailable(ngtcp2)
+    # Same treatment as nghttp3 below: populate first so the tests subdirectory
+    # (which wants extra dependencies and collides with nghttp3's targets) can
+    # be patched out before the project is added. Fresh source trees otherwise
+    # fail at generate time with "ngtcp2-src/tests/CMakeLists.txt:72
+    # (add_executable)".
+    FetchContent_GetProperties(ngtcp2)
+    if(NOT ngtcp2_POPULATED)
+        FetchContent_Populate(ngtcp2)
+    endif()
+    file(READ "${ngtcp2_SOURCE_DIR}/CMakeLists.txt" _ngtcp2_root_cml)
+    string(REGEX REPLACE "add_subdirectory\\(tests\\)"
+                         "# add_subdirectory(tests) - disabled (hy2 patch)"
+                         _ngtcp2_root_cml "${_ngtcp2_root_cml}")
+    string(REPLACE "enable_testing()" "# enable_testing() - disabled (hy2 patch)"
+                   _ngtcp2_root_cml "${_ngtcp2_root_cml}")
+    file(WRITE "${ngtcp2_SOURCE_DIR}/CMakeLists.txt" "${_ngtcp2_root_cml}")
+    add_subdirectory(${ngtcp2_SOURCE_DIR} ${ngtcp2_BINARY_DIR} EXCLUDE_FROM_ALL)
 
     # --- ngtcp2 patch: fixed-rate loss-insensitive "Brutal" CC ---------------
     # Hysteria's sender for lossy long-RTT paths: window = rate * srtt and

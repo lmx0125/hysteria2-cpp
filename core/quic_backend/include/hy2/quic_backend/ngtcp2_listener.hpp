@@ -119,4 +119,9 @@ private:
     void CloseWakePipe();
 };
 
+// Test hook: the connection-table key used to route an inbound datagram to its
+// connection. Exposed so tests can assert that distinct peers never collide
+// (a collision would route one client's packets into another's connection).
+uint64_t AddrKeyForTest(const struct sockaddr* addr, socklen_t len);
+
 } // namespace hy2::quic_backend

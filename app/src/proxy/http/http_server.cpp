@@ -69,23 +69,42 @@ std::string base64Decode(const std::string& input) {
     return output;
 }
 
-// Read a line from connection (up to \n)
-std::string readLine(server::IConn& conn) {
-    DBG_LOG("readLine: entering");
-    std::string line;
-    char c;
-    while (true) {
-        size_t n = conn.Read(reinterpret_cast<uint8_t*>(&c), 1);
-        if (n == 0) {
-            DBG_LOG("readLine: connection closed", "line_so_far", line);
-            break;
+// Buffered line reader over an IConn.
+//
+// readLine() used to call conn.Read(&c, 1) for every single byte, so a CONNECT
+// request (request line plus ~6 headers, 200-400 bytes) cost 200-400 recv()
+// syscalls - roughly a millisecond of pure syscall overhead per request, and it
+// dominated the first-byte latency of the HTTP proxy. This fills a 4KB buffer
+// and scans it, so the same request costs one or two reads.
+//
+// Semantics match the old readLine(): returns the line without its CR/LF, and
+// returns whatever partial line was buffered when the peer closes (empty
+// string if it closed before sending anything).
+class LineReader {
+public:
+    explicit LineReader(server::IConn& conn) : conn_(conn) {}
+
+    std::string ReadLine() {
+        std::string line;
+        for (;;) {
+            while (pos_ < filled_) {
+                const char c = static_cast<char>(buf_[pos_++]);
+                if (c == '\n') return line;
+                if (c != '\r') line.push_back(c);
+            }
+            const size_t n = conn_.Read(buf_, sizeof(buf_));
+            if (n == 0) return line; // EOF
+            filled_ = n;
+            pos_ = 0;
         }
-        if (c == '\n') break;
-        if (c != '\r') line.push_back(c);
     }
-    DBG_LOG("readLine: done", "line", line);
-    return line;
-}
+
+private:
+    server::IConn& conn_;
+    uint8_t buf_[4096];
+    size_t pos_ = 0;
+    size_t filled_ = 0;
+};
 
 } // anonymous namespace
 
@@ -95,7 +114,8 @@ std::string readLine(server::IConn& conn) {
 void HttpServer::dispatch(std::shared_ptr<server::IConn> conn) {
     try {
         // Read request line
-        std::string requestLine = readLine(*conn);
+        LineReader reader(*conn);
+        std::string requestLine = reader.ReadLine();
         if (requestLine.empty()) {
             conn->Close();
             return;
@@ -115,9 +135,10 @@ void HttpServer::dispatch(std::shared_ptr<server::IConn> conn) {
         // Read all headers until empty line
         std::string authHeader;
         std::string rawHeaders;
+        rawHeaders.reserve(1024);
         size_t contentLength = 0;
         while (true) {
-            std::string line = readLine(*conn);
+            std::string line = reader.ReadLine();
             if (line.empty()) break;
             rawHeaders += line + "\r\n";
             if (line.substr(0, 20) == "Proxy-Authorization:") {

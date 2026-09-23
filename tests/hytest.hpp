@@ -1,11 +1,16 @@
 // hytest.hpp - Minimal single-header test harness for hy2 tests.
 #pragma once
 
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace hytest {
@@ -25,22 +30,117 @@ inline bool Register(const char* name, void (*fn)()) {
     return true;
 }
 
-inline int RunAll() {
-    size_t failed = 0;
-    for (const auto& t : Registry()) {
-        std::printf("[ RUN ] %s\n", t.name);
-        std::fflush(stdout);
+// How a single test finished. kTimeout means the worker thread never returned
+// within the budget: it is detached and the run continues with the next test.
+enum class TestOutcome { kPassed, kFailed, kTimeout };
+
+struct TestResult {
+    TestOutcome outcome = TestOutcome::kFailed;
+    std::string error;      // failure message (kFailed only)
+    long long elapsedMs = 0;
+};
+
+// Runs one test on its own thread with a hard wall-clock budget. A hung test
+// (blocked socket/condvar/deadlock) can be neither killed nor joined in C++,
+// so it is detached and the process must not run static destructors after a
+// timeout - callers must use std::_Exit() once any test timed out.
+inline TestResult RunOneTimed(const TestCase& t, std::chrono::seconds timeout) {
+    TestResult result;
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    bool passed = false;
+    std::string error;
+
+    const auto started = std::chrono::steady_clock::now();
+    std::thread worker([&] {
         try {
             t.fn();
-            std::printf("[  OK ] %s\n", t.name);
+            passed = true;
         } catch (const std::exception& e) {
-            failed++;
-            std::printf("[FAIL ] %s: %s\n", t.name, e.what());
+            error = e.what();
         } catch (...) {
-            failed++;
-            std::printf("[FAIL ] %s: unknown exception\n", t.name);
+            error = "unknown exception";
         }
-        std::fflush(stdout);
+        {
+            std::lock_guard<std::mutex> lk(m);
+            done = true;
+        }
+        cv.notify_all();
+    });
+
+    {
+        std::unique_lock<std::mutex> lk(m);
+        if (!cv.wait_for(lk, timeout, [&] { return done; })) {
+            result.outcome = TestOutcome::kTimeout;
+            result.elapsedMs = timeout.count() * 1000;
+            worker.detach();
+            return result;
+        }
+    }
+    worker.join();
+    result.elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - started).count();
+    if (passed) {
+        result.outcome = TestOutcome::kPassed;
+    } else {
+        result.outcome = TestOutcome::kFailed;
+        result.error = error;
+    }
+    return result;
+}
+
+// Runs a single test and prints the [ RUN ]/[ OK ]/[FAIL ] lines.
+// Returns true when the test passed (timeout counts as failure).
+inline bool RunOnePrinted(const TestCase& t, std::chrono::seconds timeout,
+                          bool& timedOut, long long* elapsedMs = nullptr) {
+    std::printf("[ RUN ] %s\n", t.name);
+    std::fflush(stdout);
+    TestResult r = RunOneTimed(t, timeout);
+    timedOut = r.outcome == TestOutcome::kTimeout;
+    if (elapsedMs) *elapsedMs = r.elapsedMs;
+    if (r.outcome == TestOutcome::kPassed) {
+        std::printf("[  OK ] %s (%lld ms)\n", t.name, r.elapsedMs);
+    } else if (r.outcome == TestOutcome::kTimeout) {
+        std::printf("[FAIL ] %s: TIMEOUT after %lld s (worker thread detached)\n",
+                    t.name, r.elapsedMs / 1000);
+    } else {
+        std::printf("[FAIL ] %s: %s\n", t.name, r.error.c_str());
+    }
+    std::fflush(stdout);
+    return r.outcome == TestOutcome::kPassed;
+}
+
+inline int RunAllTimed(std::chrono::seconds timeout);
+
+inline int RunAll() {
+    return RunAllTimed(std::chrono::seconds(0));
+}
+
+// timeout == 0 disables the per-test budget (legacy behavior).
+inline int RunAllTimed(std::chrono::seconds timeout) {
+    size_t failed = 0;
+    bool anyTimeout = false;
+    for (const auto& t : Registry()) {
+        if (timeout.count() <= 0) {
+            std::printf("[ RUN ] %s\n", t.name);
+            std::fflush(stdout);
+            try {
+                t.fn();
+                std::printf("[  OK ] %s\n", t.name);
+            } catch (const std::exception& e) {
+                failed++;
+                std::printf("[FAIL ] %s: %s\n", t.name, e.what());
+            } catch (...) {
+                failed++;
+                std::printf("[FAIL ] %s: unknown exception\n", t.name);
+            }
+            std::fflush(stdout);
+            continue;
+        }
+        bool timedOut = false;
+        if (!RunOnePrinted(t, timeout, timedOut)) failed++;
+        if (timedOut) anyTimeout = true;
     }
     std::printf("\n========================================\n");
     std::printf("  Total:     %zu test(s)\n", Registry().size());
@@ -48,6 +148,12 @@ inline int RunAll() {
     std::printf("  Failed:    %zu\n", failed);
     std::printf("  Result:    %s\n", failed == 0 ? "ALL PASSED" : "HAS FAILURES");
     std::printf("========================================\n");
+    std::fflush(stdout);
+    if (anyTimeout) {
+        // A detached worker may hold heap/locks; static destructors could
+        // deadlock or crash. Exit hard, keep the already printed summary.
+        std::_Exit(1);
+    }
     return failed == 0 ? 0 : 1;
 }
 

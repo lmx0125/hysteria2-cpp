@@ -520,8 +520,10 @@ private:
         Worker w;
         w.conn = conn;
         w.done = std::make_shared<std::atomic<bool>>(false);
-        auto* done = w.done.get();
-        w.th = std::thread([this, conn, done] {
+        // Capture the shared_ptr (not a raw pointer): Close() clears workers_
+        // before joining, so the old raw `done` pointer could dangle and the
+        // final `done->store(true)` wrote into freed memory.
+        w.th = std::thread([this, conn, done = w.done] {
             try {
                 handleClient(conn);
             } catch (...) {

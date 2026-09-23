@@ -32,4 +32,11 @@ private:
     DirectOutboundMode mode_;
 };
 
+// Test hook: how many times the UDP send path has called getaddrinfo().
+// A session's destination is resolved once and then cached, so this should
+// grow by at most one per distinct target no matter how many datagrams are
+// sent. Used by DirectOutboundUdp* tests to catch a regression back to
+// per-datagram resolution.
+uint64_t DirectOutboundUdpResolveCount();
+
 } // namespace hy2::outbounds

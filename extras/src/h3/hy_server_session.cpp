@@ -253,13 +253,29 @@ void HySession::ServeStream(std::shared_ptr<IQuicStream> st) {
 
     auto okBytes = SerializeTCPResponse(true, "");
     try {
+        if (std::getenv("HY2_DIAG")) {
+            std::fprintf(stderr, "[hy2-server] writing TCP response ok (%zu bytes) to stream\n",
+                         okBytes.size());
+            std::fflush(stderr);
+        }
         st->Write(okBytes.data(), okBytes.size());
     } catch (...) {
         return;
     }
 
     // Relay both directions until either side closes.
+    if (std::getenv("HY2_DIAG")) {
+        std::fprintf(stderr, "[hy2-server] response sent, relaying %s\n", addr.c_str());
+        std::fflush(stderr);
+    }
+    const auto relayStart = std::chrono::steady_clock::now();
     CopyTwoWay(st, remote);
+    if (std::getenv("HY2_DIAG")) {
+        std::fprintf(stderr, "[hy2-server] relay %s done in %lld ms\n", addr.c_str(),
+                     (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - relayStart).count());
+        std::fflush(stderr);
+    }
 
     try { st->Close(); } catch (...) {}
     if (remote) remote->Close();

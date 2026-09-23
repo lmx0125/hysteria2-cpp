@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -52,6 +53,15 @@ public:
     // Drain queued packets (non-blocking). Call after Drive() or on EPOLLOUT.
     // Returns number of bytes still queued (0 = empty).
     size_t DrainTxQueue();
+
+    // Test seam: enqueue a packet exactly the way the WOULDBLOCK branch of
+    // Send()/SendTo() does, so the drain contract can be tested without a real
+    // kernel backpressure event. It is needed because Windows loopback drops
+    // datagrams destined for a full receive queue instead of applying
+    // backpressure, so Send() cannot be driven into WSAEWOULDBLOCK there.
+    // `to == nullptr` selects the connected-send form, like Send().
+    void EnqueueForTest(const uint8_t* data, size_t len,
+                        const struct sockaddr* to = nullptr, socklen_t tolen = 0);
 
     // Non-blocking recv. Returns bytes received or -1 (EAGAIN/EWOULDBLOCK).
     int Recv(uint8_t* buf, size_t buflen);
@@ -109,8 +119,28 @@ private:
     // Try to send one queued packet. Returns true if sent, false if WOULDBLOCK.
     bool DrainOnePacket(TxPacket& pkt);
 
+    // Appends to txQueue_ and raises txQueued_. Caller must hold txMu_.
+    // Every enqueue goes through here so the flag cannot be forgotten at one
+    // of the four would-block sites (a missed store strands that packet).
+    void EnqueueTxLocked(TxPacket&& pkt);
+
     int fd_ = -1;
     size_t maxDatagramSize_ = 1350;
+    // Fast-path guard for DrainTxQueue(): true iff txQueue_ is non-empty.
+    // Written under txMu_ (release), read without the lock (acquire).
+    //
+    // Why it exists: the server hands the SAME UdpSocket to every connection,
+    // so txMu_ is listener-wide. DrainTxQueue() is called once per Drive() and
+    // once per ServerLoop() iteration by each connection, and it used to take
+    // that shared lock unconditionally - even when the queue was empty, which
+    // is the normal case (a successful sendto never queues anything). With N
+    // connections that was N-way contention on one cache line for no work.
+    // The flag turns the common case into a single load.
+    //
+    // Conservative by construction: it may read true when the queue is already
+    // empty (one wasted lock acquire), never false when the queue is non-empty
+    // (which would strand a packet). Every writer holds txMu_.
+    std::atomic<bool> txQueued_{false};
     // Guards txQueue_ and the diagnostic counters. The hot send path only
     // takes this lock when the kernel buffer is full (rare), so concurrent
     // senders (one worker thread per server connection) do not serialize.

@@ -91,6 +91,12 @@ public:
     virtual std::shared_ptr<IByteReaderWriter> TCP(const std::string& addr) = 0;
     virtual std::shared_ptr<HyUDPConn> UDP() = 0;
     virtual void Close() = 0;
+
+    // Live counters for the connection behind this client, so a pool can tell
+    // which of its connections is actually delivering. Defaulted: a client that
+    // has no such notion (or a test double) reports zeros and the caller falls
+    // back to its other inputs.
+    virtual QuicStatsSnapshot Stats() const { return {}; }
 };
 
 struct HandshakeInfo {

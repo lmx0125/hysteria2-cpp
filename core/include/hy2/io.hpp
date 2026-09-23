@@ -118,11 +118,23 @@ public:
     // TrySend: drops the value when the buffer is full (like Go select/default
     // usage in udp.go feed()). Returns false if dropped or closed.
     bool TrySend(T v) {
-        std::lock_guard<std::mutex> lk(mu_);
-        if (closed_) return false;
-        if (q_.size() >= cap_) return false;
-        q_.push_back(std::move(v));
-        cv_.notify_one();
+        bool wake = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (closed_) return false;
+            if (q_.size() >= cap_) return false;
+            // Edge-triggered wake: only the empty -> non-empty transition needs
+            // to notify. A consumer that is parked observed an empty queue, so
+            // this notify reaches it; one that is running re-checks the
+            // predicate under mu_ before parking and will see this value. Under
+            // a burst this removes one futex wake per element (the same fix
+            // applied to the QUIC datagram queue and the relay write queues).
+            // Valid because each Channel has a single consumer; ReceiveFor's
+            // timeout is the backstop if that ever changes.
+            wake = q_.empty();
+            q_.push_back(std::move(v));
+        }
+        if (wake) cv_.notify_one();
         return true;
     }
 

@@ -21,6 +21,19 @@ HyServer::HyServer(const HyServerParams& params,
     // Make the configured congestion controller reach the QUIC transport.
     sp.quicCfg.CongestionControl = params_.congestionType;
 
+    // Idle timeout: MUST be set. A zero value means "no timeout" in QUIC, so
+    // leaving it at the default disabled it entirely and a peer that vanished
+    // without a CONNECTION_CLOSE (crash, killed process, dropped link) was
+    // never reaped: the connection, its ServerLoop thread and the per-session
+    // worker (which joins the blocked stream/datagram loops) stayed alive for
+    // the process lifetime. Measured: ~9 threads and ~9MB leaked per abandoned
+    // connection, never reclaimed even after minutes of idle. core's server
+    // (server.cpp) has always applied this default; this facade did not.
+    // Mirrors the core default and range (see server.cpp).
+    if (sp.quicCfg.MaxIdleTimeout.ns == 0) {
+        sp.quicCfg.MaxIdleTimeout = Duration::FromSeconds(30);
+    }
+
     listener_ = quic_backend::Ngtcp2Listener::Create(sp);
     if (!listener_) {
 #ifdef _WIN32

@@ -90,6 +90,18 @@ HY_TEST(DefraggerSingleFragmentPassThrough)
     HY_CHECK_EQ(out->Data.size(), (size_t)3);
 }
 
+// H3: the non-fragmented case must pass the caller's object through instead of
+// copying it (the old const& signature always made a full copy per datagram).
+HY_TEST(DefraggerSingleFragmentZeroCopy)
+{
+    Defragger d;
+    auto in = std::make_shared<UDPMessage>(makeTestMsg({1, 2, 3}));
+    auto out = d.Feed(in);
+    HY_CHECK(out != nullptr);
+    HY_CHECK(out == in); // same object (no copy)
+    HY_CHECK_EQ(out->Data.size(), (size_t)3);
+}
+
 HY_TEST(DefraggerCollectsAndAssembles)
 {
     Defragger d;

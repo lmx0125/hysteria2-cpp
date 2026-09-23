@@ -4,6 +4,7 @@
 #include "hy2/outbounds/direct.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -48,6 +49,9 @@ static bool g_wsaInit = true;
 #endif
 
 constexpr int kDialTimeoutSec = 10;
+
+// Test hook counter (see DirectOutboundUdpResolveCount in direct.hpp).
+std::atomic<uint64_t> g_udpResolveCalls{0};
 
 // ---------------------------------------------------------------------------
 // TCP Fast Open (TFO) support
@@ -268,8 +272,15 @@ int dialTCP(const std::string& ip, uint16_t port, int timeoutSec) {
     fd_set wf;
     FD_ZERO(&wf);
     FD_SET(static_cast<SOCKET>(fd), &wf);
+    // Windows reports a *failed* connect in the EXCEPTION set, not the write
+    // set. Watching writefds alone made every refused/unreachable target wait
+    // out the full timeout (measured: 10 s for 127.0.0.1:1) before the server
+    // answered "dial failed" - the client saw a 10 s stall per dead target.
+    fd_set ef;
+    FD_ZERO(&ef);
+    FD_SET(static_cast<SOCKET>(fd), &ef);
     struct timeval tv{timeoutSec, 0};
-    if (select(0, nullptr, &wf, nullptr, &tv) <= 0) {
+    if (select(0, nullptr, &wf, &ef, &tv) <= 0) {
         closesocket(fd);
         return -1;
     }
@@ -446,22 +457,12 @@ public:
     void WriteTo(const uint8_t* buf, size_t len, const std::string& addr) override {
         if (fd_ < 0) return;
 
-        // Parse addr (host:port) for destination
-        auto colon = addr.rfind(':');
-        if (colon == std::string::npos) return;
-        std::string host = addr.substr(0, colon);
-        uint16_t port = static_cast<uint16_t>(std::atoi(addr.c_str() + colon + 1));
-
-        struct addrinfo hints{};
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_DGRAM;
-        struct addrinfo* res = nullptr;
-        std::string portStr = std::to_string(port);
-        if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) return;
+        struct sockaddr_storage sa{};
+        socklen_t saLen = 0;
+        if (!ResolveTarget(addr, &sa, &saLen)) return;
 
         ::sendto(fd_, reinterpret_cast<const char*>(buf), static_cast<int>(len), 0,
-                 res->ai_addr, static_cast<int>(res->ai_addrlen));
-        freeaddrinfo(res);
+                 reinterpret_cast<const struct sockaddr*>(&sa), static_cast<int>(saLen));
     }
 
     void Close() override {
@@ -510,6 +511,61 @@ private:
         }
     }
 
+    // ResolveTarget fills *sa/*saLen with the destination for addr.
+    //
+    // This used to call getaddrinfo() on every datagram: WriteTo is the UDP
+    // send path, so at 10k datagrams/s that was 10k resolver calls, each with
+    // its own addrinfo list allocation, plus two std::string temporaries - and
+    // for a hostname it was a blocking DNS lookup per packet, with the address
+    // coming from the client's datagram (a DoS amplifier). A session's target
+    // is constant, so the result is cached: after the first datagram this is a
+    // string compare. Numeric addresses (the common case) are resolved with
+    // AI_NUMERICHOST, which never touches the resolver; only a real hostname
+    // falls back to a full lookup, and only on a cache miss.
+    bool ResolveTarget(const std::string& addr, struct sockaddr_storage* sa, socklen_t* saLen) {
+        std::lock_guard<std::mutex> lk(addrMu_);
+        if (addrCacheValid_ && addr == addrCacheKey_) {
+            *sa = addrCacheSa_;
+            *saLen = addrCacheLen_;
+            return true;
+        }
+
+        const auto colon = addr.rfind(':');
+        if (colon == std::string::npos) return false;
+        const std::string host = addr.substr(0, colon);
+        const uint16_t port = static_cast<uint16_t>(std::atoi(addr.c_str() + colon + 1));
+
+        struct addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_DGRAM;
+        hints.ai_flags = AI_NUMERICHOST;
+        struct addrinfo* res = nullptr;
+        const std::string portStr = std::to_string(port);
+        g_udpResolveCalls.fetch_add(1, std::memory_order_relaxed);
+        if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
+            // Not a numeric literal - pay for a real lookup (once per address).
+            res = nullptr;
+            hints.ai_flags = 0;
+            g_udpResolveCalls.fetch_add(1, std::memory_order_relaxed);
+            if (getaddrinfo(host.c_str(), portStr.c_str(), &hints, &res) != 0 || !res) {
+                return false;
+            }
+        }
+        if (res->ai_addrlen > sizeof(*sa)) {
+            freeaddrinfo(res);
+            return false;
+        }
+        std::memcpy(sa, res->ai_addr, res->ai_addrlen);
+        *saLen = static_cast<socklen_t>(res->ai_addrlen);
+        freeaddrinfo(res);
+
+        addrCacheKey_ = addr;
+        addrCacheSa_ = *sa;
+        addrCacheLen_ = *saLen;
+        addrCacheValid_ = true;
+        return true;
+    }
+
     int fd_;
     std::string remoteHost_;
     uint16_t remotePort_;
@@ -518,9 +574,21 @@ private:
     std::deque<std::pair<std::vector<uint8_t>, std::string>> queue_;
     bool closed_ = false;
     std::thread pumpThread_;
+
+    // Destination cache, guarded by its own mutex so a cache miss (which may
+    // block in the resolver) never holds mu_ - ReadFrom/Close/pumpLoop need it.
+    std::mutex addrMu_;
+    std::string addrCacheKey_;
+    struct sockaddr_storage addrCacheSa_{};
+    socklen_t addrCacheLen_ = 0;
+    bool addrCacheValid_ = false;
 };
 
 } // anonymous namespace
+
+uint64_t DirectOutboundUdpResolveCount() {
+    return g_udpResolveCalls.load(std::memory_order_relaxed);
+}
 
 // ---------------------------------------------------------------------------
 // DirectOutbound

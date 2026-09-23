@@ -81,10 +81,20 @@ public:
 
     bool IsClosed() const;
 
-private:
-    Ngtcp2Stream(Ngtcp2Connection* conn, int64_t streamId);
+    // HY2_DIAG stall helper: prints the stream's read/write state. Uses
+    // try_lock so it never blocks the caller; reports whether a lock is held.
+    void DiagPrint();
 
-    Ngtcp2Connection* conn_ = nullptr;
+private:
+    Ngtcp2Stream(std::shared_ptr<Ngtcp2Connection> conn, int64_t streamId);
+
+    // Weak, not raw: the application can hold a stream after the connection it
+    // belongs to is gone (the client pool drops its Client on a node switch,
+    // after which the connection is kept alive only by its own IO thread and is
+    // freed the moment that loop exits). Read()/Write() must therefore never
+    // dereference the connection directly - lock() fails once the connection's
+    // strong count reaches zero, so a detached stream simply stops notifying.
+    std::weak_ptr<Ngtcp2Connection> conn_;
     int64_t streamId_ = 0;
 
     mutable std::mutex readMu_;
@@ -94,6 +104,12 @@ private:
     bool readClosed_ = false;
     // Set by OnStreamData, cleared by FlushReadNotify (guarded by readMu_).
     bool readDirty_ = false;
+    // Bytes consumed by the application but not yet returned to the peer as
+    // flow-control credit (guarded by readMu_). Credit is returned in batches
+    // to keep the per-read connection-lock traffic low; the receive window
+    // stays bounded because credit is only ever returned for consumed bytes.
+    uint64_t recvCreditPending_ = 0;
+    static constexpr uint64_t kRecvCreditBatch = 256 * 1024;
 
     mutable std::mutex writeMu_;
     // Chunked buffer holding every byte that is not acknowledged yet: ngtcp2

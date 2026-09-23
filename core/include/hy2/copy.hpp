@@ -30,4 +30,18 @@ std::string CopyTwoWayEx(const std::string& id,
 std::string CopyTwoWay(std::shared_ptr<IByteReaderWriter> serverRw,
                        std::shared_ptr<IByteReaderWriter> remoteRw);
 
+// Copy-buffer pool counters, exposed for regression tests.
+//   blocksFreshAllocs:        32KB blocks taken from the heap because the pool
+//                             was empty (each one is a fresh allocation).
+//   blocksReturnedToCentral:  blocks handed back to the shared central pool.
+// A relay thread holds one block for its lifetime, so a healthy pool keeps
+// blocksFreshAllocs near constant while blocksReturnedToCentral grows with the
+// number of finished relays. If blocksFreshAllocs grows with the connection
+// count, blocks are being leaked on thread exit (see TLSData's destructor).
+struct CopyPoolStats {
+    uint64_t blocksFreshAllocs = 0;
+    uint64_t blocksReturnedToCentral = 0;
+};
+CopyPoolStats CopyPoolStatsSnapshot();
+
 } // namespace hy2::server

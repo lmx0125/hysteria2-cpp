@@ -309,3 +309,76 @@ HY_TEST(DirectOutbound_ModeSelection) {
     HY_CHECK(conn != nullptr);
     conn->Close();
 }
+
+// The UDP send path used to call getaddrinfo() on every datagram (allocating an
+// addrinfo list each time, and doing a blocking DNS lookup per packet for a
+// hostname target). A session target is constant, so it must be resolved once
+// and then cached. This checks both halves: the datagrams still all arrive, and
+// the resolve count does not grow with the datagram count.
+HY_TEST(DirectOutbound_UdpResolvesTargetOnce) {
+    UdpEchoServer server;
+    HY_CHECK(server.ok());
+
+    DirectOutbound ob(DirectOutboundMode::IPv4Only);
+    const std::string addr = "127.0.0.1:" + std::to_string(server.port());
+    auto conn = ob.UDP(addr);
+    HY_CHECK(conn != nullptr);
+
+    constexpr size_t kDatagrams = 32;
+    const char* msg = "burst";
+    const size_t msgLen = std::strlen(msg);
+
+    const uint64_t before = DirectOutboundUdpResolveCount();
+    for (size_t i = 0; i < kDatagrams; ++i) {
+        conn->WriteTo(reinterpret_cast<const uint8_t*>(msg), msgLen, addr);
+    }
+
+    size_t received = 0;
+    for (size_t i = 0; i < kDatagrams; ++i) {
+        uint8_t buf[64] = {};
+        std::string from;
+        const size_t n = conn->ReadFrom(buf, sizeof(buf), from);
+        if (n == 0) break;
+        HY_CHECK(std::string(reinterpret_cast<const char*>(buf), n) == "burst");
+        ++received;
+    }
+    HY_CHECK_EQ(received, kDatagrams);
+
+    const uint64_t after = DirectOutboundUdpResolveCount();
+    HY_CHECK(after - before <= 1);
+
+    conn->Close();
+}
+
+// Changing the destination must actually change where the datagram goes, i.e.
+// the cache must not serve a stale entry for a different address. Each echo
+// server replies from its own address, so the reply's source port proves which
+// one received the datagram.
+HY_TEST(DirectOutbound_UdpTargetChangeFollowed) {
+    UdpEchoServer serverA;
+    UdpEchoServer serverB;
+    HY_CHECK(serverA.ok());
+    HY_CHECK(serverB.ok());
+    HY_CHECK(serverA.port() != serverB.port());
+
+    DirectOutbound ob(DirectOutboundMode::IPv4Only);
+    const std::string addrA = "127.0.0.1:" + std::to_string(serverA.port());
+    const std::string addrB = "127.0.0.1:" + std::to_string(serverB.port());
+    auto conn = ob.UDP(addrA);
+    HY_CHECK(conn != nullptr);
+
+    uint8_t buf[64] = {};
+    std::string from;
+
+    const char* toA = "to-A";
+    conn->WriteTo(reinterpret_cast<const uint8_t*>(toA), std::strlen(toA), addrA);
+    HY_CHECK(conn->ReadFrom(buf, sizeof(buf), from) > 0);
+    HY_CHECK_EQ(from, addrA);
+
+    const char* toB = "to-B";
+    conn->WriteTo(reinterpret_cast<const uint8_t*>(toB), std::strlen(toB), addrB);
+    HY_CHECK(conn->ReadFrom(buf, sizeof(buf), from) > 0);
+    HY_CHECK_EQ(from, addrB);
+
+    conn->Close();
+}

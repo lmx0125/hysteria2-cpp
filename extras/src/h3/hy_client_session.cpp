@@ -134,7 +134,7 @@ proto::UDPMessage HyClient::UDPReceive() {
         try {
             auto dfMsg = udpDefrag_.Feed(ParseUDPMessage(d));
             if (!dfMsg) continue; // incomplete fragment set - wait for more
-            return *dfMsg;
+            return std::move(*dfMsg); // sole owner: move the payload out
         } catch (...) {
             continue; // invalid - wait for next
         }

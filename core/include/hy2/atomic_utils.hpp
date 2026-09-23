@@ -1,6 +1,7 @@
 // atomic_utils.hpp - Rewrite of core/internal/utils/atomic.go.
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <mutex>
 
@@ -18,13 +19,11 @@ public:
     }
 
     void Set(int64_t nanos) {
-        std::lock_guard<std::mutex> lk(mu_);
-        ns_ = nanos;
+        ns_.store(nanos, std::memory_order_relaxed);
     }
 
     int64_t Get() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return ns_;
+        return ns_.load(std::memory_order_relaxed);
     }
 
     bool OlderThan(int64_t nanos, int64_t timeoutNs) const {
@@ -32,8 +31,12 @@ public:
     }
 
 private:
-    mutable std::mutex mu_;
-    int64_t ns_;
+    // Relaxed atomics, not a mutex: this is a best-effort activity timestamp
+    // where no ordering between the timestamp and any other data is required,
+    // and an aligned 64-bit load/store is atomic on every target. The mutex it
+    // replaces was acquired twice per UDP datagram on the server's hot path
+    // (server_udp.cpp Feed + receiveLoop).
+    std::atomic<int64_t> ns_;
 };
 
 // Atomic<T> mirrors utils.Atomic[T] (mutex-backed, like atomic.Value).

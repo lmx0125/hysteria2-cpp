@@ -7,6 +7,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "hy2/server_iface.hpp"
 
@@ -51,7 +52,7 @@ private:
     std::string secret_;
     std::mutex mutex_;
     std::unordered_map<std::string, TrafficStats> stats_;
-    std::unordered_map<std::string, bool> kicked_; // kicked user IDs
+    std::unordered_set<std::string> kicked_; // kicked user IDs
 };
 
 } // namespace hy2::trafficlogger

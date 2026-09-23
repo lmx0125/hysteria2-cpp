@@ -119,6 +119,14 @@ public:
     std::string LocalAddr() const override;
     std::string RemoteAddr() const override;
 
+    // Returns flow-control credit for bytes the application consumed from a
+    // stream (called by Ngtcp2Stream::Read). Consumption - not arrival -
+    // drives the receive window, so a slow reader bounds how much the peer
+    // may send and Ngtcp2Stream::readBuf_ stays bounded. Safe to call with a
+    // closed/unknown stream id (ngtcp2 ignores it); wakes the IO loop so the
+    // MAX_STREAM_DATA/MAX_DATA update is emitted promptly.
+    void ExtendReadCredit(int64_t stream_id, uint64_t credit);
+
     // Congestion control integration
     void SetCongestionControl(std::shared_ptr<cc::CongestionControl> cc) override;
 
@@ -144,6 +152,14 @@ public:
     // Used when a stale connection is replaced on a reused UDP 4-tuple so
     // its worker loop stops emitting packets towards the new client.
     void Abort();
+
+    // Clears the non-owning references into the owning Ngtcp2Listener (wake
+    // pipe write end, shared server socket, listener back pointer). Called by
+    // Ngtcp2Listener::Close() before the listener is torn down: a server
+    // connection can outlive it (the H3 handler and its detached stream
+    // workers hold it), and Stream::Write() would otherwise send through the
+    // freed wake socket handle.
+    void DetachFromListener();
 
     // Called by event loop on timeout.
     void OnTimeout();
@@ -204,8 +220,13 @@ public:
     bool IsHandshakeComplete() const { return handshakeComplete_.load(); }
 
     // True once the connection reached a terminal state (idle close, peer
-    // CONNECTION_CLOSE/draining, or explicit local close).
-    bool IsClosed() const { return closed_.load(); }
+    // CONNECTION_CLOSE/draining, or explicit local close). Overrides
+    // IQuicConnection so callers holding only the interface can notice a
+    // connection that died on its own.
+    bool IsClosed() const override { return closed_.load(); }
+
+    // IQuicConnection: backend-neutral counters for the rate controller.
+    QuicStatsSnapshot GetStatsSnapshot() const override;
 
     // Get ngtcp2 connection ID for logging.
     uint64_t GetConnectionId() const;
@@ -229,6 +250,11 @@ public:
 
     // Print full stats to stderr for profiling.
     void PrintStats() const;
+
+    // HY2_DIAG stall helper: once per second prints the event-loop counters
+    // and the state of every stream (buffered bytes, offsets, which stream
+    // mutex is held). One run then shows exactly where a transfer stalled.
+    void ConnHeartbeat(const char* role);
 
     // Socket TX stats for download diagnostics.
     struct SocketTxStats {
@@ -293,7 +319,22 @@ private:
     // batch. Must run on the IO thread right after draining the socket and
     // before Drive() (which may destroy closed streams).
     void FlushReadNotifyBatch();
+
+    // Marks every stream this connection created as closed (EOF + write side
+    // closed) and wakes its blocked readers/writers. An application can hold a
+    // stream past the connection's lifetime (the pool drops its Client on a
+    // node switch while the session keeps using the flow), so the close and the
+    // destructor must release those waiters explicitly - otherwise they either
+    // park forever or, in the old raw-pointer design, touched freed memory.
+    void NotifyStreamsClosed();
     std::vector<Ngtcp2Stream*> readDirtyStreams_;
+
+    // Release everything parked on this connection: the IO loop, the datagram
+    // consumer, the accept waiters and the streams. Idempotent and safe to call
+    // from any thread and any number of times, so every path that can end the
+    // connection's life calls it - including the ones where the connection
+    // closes itself and no owner asked for it.
+    void WakeAllWaiters();
 
     // ngtcp2 callbacks (static trampolines to instance methods)
     static int SendPktCb(ngtcp2_conn* conn, const uint8_t* dgram, size_t dgramlen,
@@ -334,6 +375,9 @@ private:
     long long readPktNsAcc_ = 0;
     // Cumulative SendPacket duration (HY2_BW_DIAG instrumentation).
     long long sendNsAcc_ = 0;
+    // Same, reported by the once-per-second DRIVE-BREAKDOWN line (kept apart
+    // from sendNsAcc_ so the per-second [tx] report cannot zero it first).
+    long long sendNsBreakdown_ = 0;
     // Socket send/drop counters snapshot (HY2_BW_DIAG instrumentation).
     UdpSocket::Stats sockStats_{};
 
@@ -373,8 +417,12 @@ private:
 
     std::function<void(std::shared_ptr<IQuicStream>)> streamAcceptCb_;
 
-    // Datagram buffers
-    std::vector<std::vector<uint8_t>> recvDatagrams_;
+    // Datagram receive queue. Guarded by datagramMu_ (NOT mu_): enqueueing a
+    // datagram must not contend with stream callbacks / Drive's stream
+    // picking. Deque so the consumer pops in O(1) (vector::erase(begin) was
+    // O(N) per datagram and shifted the whole backlog).
+    std::deque<std::vector<uint8_t>> recvDatagrams_;
+    std::mutex datagramMu_;
     std::condition_variable datagramCv_;
 
     // Peer address (for SendPktCb)
@@ -503,6 +551,12 @@ private:
         void Reset();
     };
     Diag diag_;
+
+public:
+    // Runtime diagnostic counters. Exposed so tests can assert that the
+    // default path (HY2_BW_DIAG unset) never touches them: they must stay
+    // zero unless diagnostics are explicitly enabled.
+    const Diag& DiagCounters() const { return diag_; }
 };
 
 } // namespace hy2::quic_backend

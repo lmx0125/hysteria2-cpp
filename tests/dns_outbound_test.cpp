@@ -1,6 +1,9 @@
 // dns_outbound_test.cpp - Tests for DNS resolver (System, Standard, DoH).
 #include "hytest.hpp"
 #include "hy2/outbounds/dns_outbound.hpp"
+#include "hy2/outbounds/direct.hpp"
+
+#include <chrono>
 
 using namespace hy2::outbounds;
 

@@ -3,7 +3,11 @@
 #include "hy2/copy.hpp"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -12,6 +16,36 @@
 namespace hy2::server {
 
 namespace {
+// Runtime-gated transfer diagnostics (HY2_DIAG=1 in the environment): one
+// line per second per relay direction, so a stalled side is visible in a
+// single run instead of a bisecting test loop.
+bool CopyDiagOn() {
+    static const bool on = std::getenv("HY2_DIAG") != nullptr;
+    return on;
+}
+
+struct CopyDiag {
+    uint64_t bytes = 0;
+    uint64_t calls = 0;
+    int64_t nextMs = 0;
+
+    void Add(const char* tag, size_t n) {
+        if (!CopyDiagOn()) return;
+        bytes += n;
+        ++calls;
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowMs >= nextMs) {
+            std::fprintf(stderr, "[copy] %s calls=%llu bytes=%llu last=%zu\n", tag,
+                         (unsigned long long)calls, (unsigned long long)bytes, n);
+            std::fflush(stderr);
+            bytes = 0;
+            calls = 0;
+            nextMs = nowMs + 1000;
+        }
+    }
+};
+
 constexpr size_t kCopyBufSize = 32 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -20,15 +54,10 @@ constexpr size_t kCopyBufSize = 32 * 1024;
 // ---------------------------------------------------------------------------
 struct FreeBlock { FreeBlock* next; };
 
-struct TLSData {
-    FreeBlock* head = nullptr;
-    uint32_t count = 0;
-};
-
-static inline TLSData& GetTLS() {
-    static thread_local TLSData tls;
-    return tls;
-}
+// Pool counters. Test/diagnostic hooks only (see CopyPoolStatsSnapshot() in
+// copy.hpp); relaxed atomics, no ordering requirement.
+std::atomic<uint64_t> g_poolFreshAllocs{0};    // ::operator new fallbacks
+std::atomic<uint64_t> g_poolCentralReturns{0}; // blocks handed back to central
 
 struct CentralPool {
     std::mutex mu;
@@ -42,6 +71,7 @@ struct CentralPool {
             head = items[i];
         }
         count += n;
+        g_poolCentralReturns.fetch_add(n, std::memory_order_relaxed);
     }
 
     uint32_t PopBatch(FreeBlock** out, uint32_t n) {
@@ -58,8 +88,42 @@ struct CentralPool {
 };
 
 static CentralPool& GetCentral() {
-    static CentralPool pool;
-    return pool;
+    // Intentionally never destroyed: a thread_local destructor may run after
+    // static destructors (and after main returns for other threads), and
+    // TLSData's destructor returns its blocks here. Leaking the pool keeps it
+    // valid for the whole process lifetime.
+    static CentralPool* pool = new CentralPool();
+    return *pool;
+}
+
+struct TLSData {
+    FreeBlock* head = nullptr;
+    uint32_t count = 0;
+
+    ~TLSData() {
+        // Hand this thread's blocks back to the central pool. Without this the
+        // freelist head is simply dropped when the thread exits: a relay thread
+        // only ever holds one block, so it never reaches TLSPut's
+        // drain-to-central threshold (64) and every 32KB block would leak
+        // (64KB per proxied TCP connection: two direction threads).
+        constexpr uint32_t kBatch = 32;
+        FreeBlock* batch[kBatch];
+        while (head) {
+            uint32_t n = 0;
+            while (head && n < kBatch) {
+                FreeBlock* b = head;
+                head = b->next;
+                --count;
+                batch[n++] = b;
+            }
+            GetCentral().PushBatch(batch, n);
+        }
+    }
+};
+
+static inline TLSData& GetTLS() {
+    static thread_local TLSData tls;
+    return tls;
 }
 
 static void* TLSGet() {
@@ -75,6 +139,7 @@ static void* TLSGet() {
     FreeBlock* batch[kBatch];
     uint32_t got = GetCentral().PopBatch(batch, kBatch);
     if (got == 0) {
+        g_poolFreshAllocs.fetch_add(1, std::memory_order_relaxed);
         return ::operator new(kCopyBufSize);
     }
     void* result = batch[0];
@@ -214,14 +279,23 @@ std::string CopyTwoWayEx(const std::string& id,
 std::string CopyTwoWay(std::shared_ptr<IByteReaderWriter> serverRw,
                        std::shared_ptr<IByteReaderWriter> remoteRw) {
     auto outcome = std::make_shared<CopyOutcome>();
+    CopyDiag diagA;  // remoteRw -> serverRw
+    CopyDiag diagB;  // serverRw -> remoteRw
+    const char* tagA = CopyDiagOn() ? "A remote->server" : "";
+    const char* tagB = CopyDiagOn() ? "B server->remote" : "";
 
     std::thread t1 = RunDirection(outcome, [&] {
         auto* raw = TLSGet();
         auto& buf = *static_cast<std::array<uint8_t, kCopyBufSize>*>(raw);
         for (;;) {
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read...\n", tagA); std::fflush(stderr); }
             size_t n = remoteRw->Read(buf.data(), buf.size());
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read=%zu\n", tagA, n); std::fflush(stderr); }
             if (n == 0) break;
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s write %zu...\n", tagA, n); std::fflush(stderr); }
             serverRw->Write(buf.data(), n);
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s wrote %zu\n", tagA, n); std::fflush(stderr); }
+            diagA.Add(tagA, n);
         }
         TLSPut(raw);
     });
@@ -229,9 +303,14 @@ std::string CopyTwoWay(std::shared_ptr<IByteReaderWriter> serverRw,
         auto* raw = TLSGet();
         auto& buf = *static_cast<std::array<uint8_t, kCopyBufSize>*>(raw);
         for (;;) {
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read...\n", tagB); std::fflush(stderr); }
             size_t n = serverRw->Read(buf.data(), buf.size());
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read=%zu\n", tagB, n); std::fflush(stderr); }
             if (n == 0) break;
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s write %zu...\n", tagB, n); std::fflush(stderr); }
             remoteRw->Write(buf.data(), n);
+            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s wrote %zu\n", tagB, n); std::fflush(stderr); }
+            diagB.Add(tagB, n);
         }
         TLSPut(raw);
     });
@@ -242,6 +321,12 @@ std::string CopyTwoWay(std::shared_ptr<IByteReaderWriter> serverRw,
     t1.join();
     t2.join();
     return firstErr;
+}
+
+CopyPoolStats CopyPoolStatsSnapshot() {
+    return CopyPoolStats{
+        g_poolFreshAllocs.load(std::memory_order_relaxed),
+        g_poolCentralReturns.load(std::memory_order_relaxed)};
 }
 
 } // namespace hy2::server

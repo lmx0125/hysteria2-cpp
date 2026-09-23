@@ -188,7 +188,7 @@ int UdpSocket::Send(const uint8_t* data, size_t len) {
             TxPacket pkt;
             pkt.data.assign(data, data + len);
             pkt.hasDest = false;
-            txQueue_.push_back(std::move(pkt));
+            EnqueueTxLocked(std::move(pkt));
             stats_.txQueueCount++;
             if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
             return static_cast<int>(len); // report success to caller
@@ -210,7 +210,7 @@ int UdpSocket::Send(const uint8_t* data, size_t len) {
             TxPacket pkt;
             pkt.data.assign(data, data + len);
             pkt.hasDest = false;
-            txQueue_.push_back(std::move(pkt));
+            EnqueueTxLocked(std::move(pkt));
             stats_.txQueueCount++;
             if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
             return static_cast<int>(len); // report success to caller
@@ -242,7 +242,7 @@ int UdpSocket::SendTo(const uint8_t* data, size_t len,
             memcpy(&pkt.to, to, tolen);
             pkt.tolen = tolen;
             pkt.hasDest = true;
-            txQueue_.push_back(std::move(pkt));
+            EnqueueTxLocked(std::move(pkt));
             stats_.txQueueCount++;
             if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
             return static_cast<int>(len);
@@ -263,7 +263,7 @@ int UdpSocket::SendTo(const uint8_t* data, size_t len,
             memcpy(&pkt.to, to, tolen);
             pkt.tolen = tolen;
             pkt.hasDest = true;
-            txQueue_.push_back(std::move(pkt));
+            EnqueueTxLocked(std::move(pkt));
             stats_.txQueueCount++;
             if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
             return static_cast<int>(len);
@@ -310,12 +310,39 @@ bool UdpSocket::DrainOnePacket(TxPacket& pkt) {
 #endif
 }
 
+void UdpSocket::EnqueueTxLocked(TxPacket&& pkt) {
+    txQueue_.push_back(std::move(pkt));
+    txQueued_.store(true, std::memory_order_release);
+}
+
+void UdpSocket::EnqueueForTest(const uint8_t* data, size_t len,
+                               const struct sockaddr* to, socklen_t tolen) {
+    TxPacket pkt;
+    pkt.data.assign(data, data + len);
+    if (to != nullptr) {
+        memcpy(&pkt.to, to, tolen);
+        pkt.tolen = tolen;
+        pkt.hasDest = true;
+    } else {
+        pkt.hasDest = false;
+    }
+    std::lock_guard<std::mutex> lk(txMu_);
+    EnqueueTxLocked(std::move(pkt));
+}
+
 size_t UdpSocket::DrainTxQueue() {
+    // Uncontended fast path: the queue is almost always empty (a successful
+    // sendto never queues anything), and txMu_ is shared by every connection
+    // on this listener. See txQueued_ in the header.
+    if (!txQueued_.load(std::memory_order_acquire)) return 0;
     for (;;) {
         TxPacket pkt;
         {
             std::lock_guard<std::mutex> lk(txMu_);
-            if (txQueue_.empty()) return 0;
+            if (txQueue_.empty()) {
+                txQueued_.store(false, std::memory_order_release);
+                return 0;
+            }
             pkt = std::move(txQueue_.front());
             txQueue_.pop_front();
         }
@@ -323,6 +350,7 @@ size_t UdpSocket::DrainTxQueue() {
             // Still WOULDBLOCK: put it back and stop.
             std::lock_guard<std::mutex> lk(txMu_);
             txQueue_.push_front(std::move(pkt));
+            txQueued_.store(true, std::memory_order_release);
             return txQueue_.size();
         }
     }

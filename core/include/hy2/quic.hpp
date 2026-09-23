@@ -30,6 +30,28 @@ public:
     using IHyStream::Close;
 };
 
+// QuicStatsSnapshot is a backend-neutral view of one connection's counters,
+// enough to tell how much a connection actually delivered and how much of what
+// it sent was lost. A rate controller needs both: delivered bytes say whether a
+// declared rate is being achieved, lost packets say whether it is being
+// exceeded (a fixed-rate sender that overshoots a link loses packets instead of
+// slowing down).
+struct QuicStatsSnapshot {
+    uint64_t bytesSent = 0;
+    uint64_t bytesReceived = 0;
+    uint64_t packetsSent = 0;
+    uint64_t packetsReceived = 0;
+    uint64_t packetsLost = 0;
+    uint64_t streamsActive = 0;
+    // Streams currently open on the connection. Distinct from streamsActive,
+    // which counts only those with a write *pending* - data queued to send. A
+    // pure download has nothing pending to write, so streamsActive reads zero
+    // while the connection is in fact carrying every byte; anything asking "is
+    // this connection carrying flows?" needs this one instead.
+    uint64_t streamsOpen = 0;
+    double smoothedRttMs = 0.0;
+};
+
 // IQuicConnection mirrors the subset of quic.Conn used by hysteria.
 class IQuicConnection {
 public:
@@ -53,6 +75,21 @@ public:
     virtual std::vector<uint8_t> ReceiveDatagram() = 0;
 
     virtual void CloseWithError(uint64_t errorCode, const std::string& reason) = 0;
+
+    // True once the connection reached a terminal state: the QUIC idle
+    // timeout, a peer CONNECTION_CLOSE/draining, or an explicit local close.
+    //
+    // A connection can die with nobody noticing - the idle timeout is the usual
+    // way, because an idle tunnel sends nothing that would reset it. Owners that
+    // only react to I/O errors keep handing out such a connection and writing
+    // into a socket nobody reads, so they need a way to ask. Default false keeps
+    // backends and test doubles that have no such notion compiling.
+    virtual bool IsClosed() const { return false; }
+
+    // Counters for rate control. Defaulted so backends and test doubles that
+    // keep no statistics stay compilable; a backend that returns nothing just
+    // makes the controller fall back to its other inputs.
+    virtual QuicStatsSnapshot GetStatsSnapshot() const { return {}; }
 
     virtual std::string LocalAddr() const = 0;
     virtual std::string RemoteAddr() const = 0;

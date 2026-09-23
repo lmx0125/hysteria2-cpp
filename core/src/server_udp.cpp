@@ -1,4 +1,4 @@
-﻿// server_udp.cpp - rewrite of core/server/udp.go
+// server_udp.cpp - rewrite of core/server/udp.go
 #include "hy2/server_udp.hpp"
 
 #include <thread>
@@ -57,9 +57,9 @@ void UdpSessionEntry::CloseWithErr(const std::string& err) {
     ExitFunc(err);
 }
 
-size_t UdpSessionEntry::Feed(std::shared_ptr<const proto::UDPMessage> msg) {
+size_t UdpSessionEntry::Feed(std::shared_ptr<proto::UDPMessage> msg) {
     Last.Set(MonoTime::Now().ns);
-    auto dfMsg = D.Feed(*msg);
+    auto dfMsg = D.Feed(std::move(msg));
     if (!dfMsg) {
         return 0;
     }
@@ -76,16 +76,17 @@ size_t UdpSessionEntry::Feed(std::shared_ptr<const proto::UDPMessage> msg) {
         }
     }
 
-    std::string addr = dfMsg->Addr;
+    // No per-packet string copy: use the message's address (or the override)
+    // by reference. The old code copied Addr into a local on every datagram.
+    const std::string* targetAddr = &dfMsg->Addr;
     if (!OverrideAddr.empty()) {
-        addr = OverrideAddr;
-    } else if (!checkAddr(addr)) {
+        targetAddr = &OverrideAddr;
+    } else if (!checkAddr(*targetAddr)) {
         throw Error("blocked");
     }
 
-    size_t n = 0;
-    conn_->WriteTo(dfMsg->Data.data(), dfMsg->Data.size(), addr);
-    n = dfMsg->Data.size();
+    const size_t n = dfMsg->Data.size();
+    conn_->WriteTo(dfMsg->Data.data(), n, *targetAddr);
     return n;
 }
 
@@ -153,8 +154,13 @@ void UdpSessionEntry::receiveLoop() {
     }
     std::vector<uint8_t> udpBuf(proto::kMaxUDPSize);
     std::vector<uint8_t> msgBuf(proto::kMaxUDPSize);
+    // Reused across iterations. ReadFrom assigns the address and every
+    // UDPMessage field is rewritten below, so hoisting these out of the loop
+    // keeps their capacity and removes 2-3 heap allocations per datagram.
+    std::string rAddr;
+    proto::UDPMessage msg;
     for (;;) {
-        std::string rAddr;
+        rAddr.clear();
         size_t udpN = 0;
         try {
             udpN = conn->ReadFrom(udpBuf.data(), udpBuf.size(), rAddr);
@@ -176,7 +182,6 @@ void UdpSessionEntry::receiveLoop() {
             rAddr = OriginalAddr;
         }
 
-        proto::UDPMessage msg;
         msg.SessionID = ID;
         msg.PacketID = 0;
         msg.FragID = 0;

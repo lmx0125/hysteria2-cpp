@@ -1,4 +1,4 @@
-﻿# tests/CMakeLists.txt - Build all test executables.
+# tests/CMakeLists.txt - Build all test executables.
 
 # ---------------------------------------------------------------------------
 # Collect all test sources (excluding main files)
@@ -27,6 +27,20 @@ set(TEST_INCLUDE_DIRS
     ${CMAKE_SOURCE_DIR}/app/include
 )
 
+# ---------------------------------------------------------------------------
+# alyssum_proxy engine sources (H7-H11/M5 tests). The engine lives in the app
+# tree but is compiled into the unified test runner so its tests participate
+# in the same program.
+# ---------------------------------------------------------------------------
+set(ALYSSUM_PROXY_FORWARD_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../apps/alyssum_proxy/src/forward")
+if(EXISTS "${ALYSSUM_PROXY_FORWARD_DIR}/proxy_engine.cpp")
+    list(APPEND TEST_SOURCES
+        "${ALYSSUM_PROXY_FORWARD_DIR}/proxy_engine.cpp"
+        "${ALYSSUM_PROXY_FORWARD_DIR}/packet_parser.cpp")
+    list(APPEND TEST_INCLUDE_DIRS "${ALYSSUM_PROXY_FORWARD_DIR}")
+endif()
+
 # Common link libs for all test targets
 set(TEST_LINK_LIBS hy2_core hy2_extras hy2_app)
 
@@ -37,6 +51,11 @@ add_executable(hy2_tests ${TEST_SOURCES} ${TEST_MAIN})
 target_include_directories(hy2_tests PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(hy2_tests PRIVATE ${TEST_LINK_LIBS})
 add_test(NAME all COMMAND hy2_tests)
+if(MSVC)
+    # PDBs so cdb can symbolize crashes in the unified runner.
+    target_compile_options(hy2_tests PRIVATE /Zi /FS)
+    target_link_options(hy2_tests PRIVATE /DEBUG)
+endif()
 
 # ---------------------------------------------------------------------------
 # 2. hy2_full_test - Unified test runner with filtering support
@@ -48,6 +67,10 @@ add_executable(hy2_full_test ${TEST_SOURCES} ${TEST_MAIN_FULL})
 target_include_directories(hy2_full_test PRIVATE ${TEST_INCLUDE_DIRS})
 target_link_libraries(hy2_full_test PRIVATE ${TEST_LINK_LIBS})
 add_test(NAME full COMMAND hy2_full_test)
+if(MSVC)
+    target_compile_options(hy2_full_test PRIVATE /Zi /FS)
+    target_link_options(hy2_full_test PRIVATE /DEBUG)
+endif()
 
 # ---------------------------------------------------------------------------
 # 3. Individual test executables for quick isolated testing

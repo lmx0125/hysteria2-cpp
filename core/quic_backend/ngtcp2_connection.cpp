@@ -1,17 +1,26 @@
 #include "hy2/quic_backend/ngtcp2_connection.hpp"
+#include "hy2/diag/lock_diag.hpp"
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
 #endif
 
 #include <cstring>
+#include "hy2/diag/lock_diag.hpp"
 #include <cstdio>
+#include "hy2/diag/lock_diag.hpp"
 #include <cstdlib>
+#include "hy2/diag/lock_diag.hpp"
 #include <cstdarg>
+#include "hy2/diag/lock_diag.hpp"
 #include <algorithm>
+#include "hy2/diag/lock_diag.hpp"
 #include <chrono>
+#include "hy2/diag/lock_diag.hpp"
 #include <iostream>
+#include "hy2/diag/lock_diag.hpp"
 #include <limits>
+#include "hy2/diag/lock_diag.hpp"
 
 #ifdef _WIN32
   #include <winsock2.h>
@@ -24,17 +33,28 @@
 #endif
 
 #include <ngtcp2/ngtcp2.h>
+#include "hy2/diag/lock_diag.hpp"
 #include <ngtcp2/ngtcp2_crypto.h>
+#include "hy2/diag/lock_diag.hpp"
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
+#include "hy2/diag/lock_diag.hpp"
 #include <openssl/err.h>
+#include "hy2/diag/lock_diag.hpp"
 #include <openssl/ssl.h>
+#include "hy2/diag/lock_diag.hpp"
 #include <openssl/rand.h>
+#include "hy2/diag/lock_diag.hpp"
 
 #include "hy2/quic_backend/udp_socket.hpp"
+#include "hy2/diag/lock_diag.hpp"
 #include "hy2/quic_backend/io_poll.hpp"
+#include "hy2/diag/lock_diag.hpp"
 #include "hy2/quic_backend/ngtcp2_stream.hpp"
+#include "hy2/diag/lock_diag.hpp"
 #include "hy2/quic_backend/ngtcp2_listener.hpp"
+#include "hy2/diag/lock_diag.hpp"
 #include "hy2/protocol.hpp"
+#include "hy2/diag/lock_diag.hpp"
 
 void (*g_hy2TraceSink)(uint32_t tag, int64_t rv) = nullptr;
 #define TTRACE(tag, rv) do { if (g_hy2TraceSink) g_hy2TraceSink((tag), (int64_t)(rv)); } while (0)
@@ -51,7 +71,13 @@ static std::atomic<bool> g_handshakeCompleted{false};
 static std::once_flag g_cryptoInitFlag;
 // Cached once: keeps the per-packet hot path free of getenv()/diag work when
 // diagnostics are disabled (the default).
-static const bool g_diagEnabled = std::getenv("HY2_BW_DIAG") != nullptr;
+// Lazy: a file-scope static initialises before main(), so a flag set
+// from the app (--debug) could never turn the diagnostics on.
+static bool Hy2DiagEnabled() {
+    static const bool v = std::getenv("HY2_BW_DIAG") != nullptr ||
+                          std::getenv("HY2_DIAG") != nullptr;
+    return v;
+}
 
 static const char* QuicPacketTypeName(uint8_t firstByte) {
     uint8_t form = (firstByte >> 7) & 1;
@@ -78,6 +104,10 @@ static double ElapsedMs() {
 }
 
 namespace hy2::quic_backend {
+
+// HY2_DIAG: count of Drive() calls that ended with ngtcp2 reporting "nothing
+// writable" (congestion/flow-control blocked). Printed by ConnHeartbeat().
+static std::atomic<uint64_t> g_driveRv0{0};
 
 static bool QuicDebugEnabled() {
     static bool v = std::getenv("HY2_QUIC_DEBUG") != nullptr;
@@ -137,7 +167,7 @@ bool Ngtcp2Connection::SendPacket(const uint8_t* data, size_t len) {
     // All counters/timers below are diagnostics: gated on the cached flag so
     // the default path has no atomic RMWs and no clock reads per packet.
     std::chrono::steady_clock::time_point spStart;
-    if (g_diagEnabled) {
+    if (Hy2DiagEnabled()) {
         if (len > 0) {
             g_txPackets.fetch_add(1, std::memory_order_relaxed);
             g_txBytes.fetch_add(static_cast<int>(len), std::memory_order_relaxed);
@@ -152,9 +182,34 @@ bool Ngtcp2Connection::SendPacket(const uint8_t* data, size_t len) {
                                    reinterpret_cast<const struct sockaddr*>(&remoteAddr_),
                                    remoteAddrLen_) >= 0;
     }
-    if (g_diagEnabled) {
-        sendNsAcc_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+    if (Hy2DiagEnabled()) {
+        const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - spStart).count();
+        sendNsAcc_ += dt;
+        sendNsBreakdown_ += dt;
+        // Per-second TX report: the decisive split between "we cannot send"
+        // (cwnd / peer) and "the local socket is the bottleneck". sendto_ms
+        // close to 1000 means the kernel/UDP path is saturated; near 0 with a
+        // low rate means the data is not being handed to us fast enough.
+        {
+            static std::mutex repMu;
+            static int64_t nextMs = 0;
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs >= nextMs) {
+                std::lock_guard<std::mutex> rl(repMu);
+                if (nowMs >= nextMs) {
+                    const long long sentNs = static_cast<long long>(sendNsAcc_);
+                    sendNsAcc_ = 0;
+                    std::fprintf(stderr, "[tx] 1s pkts=%llu bytes=%lluKB sendto_ms=%lld\n",
+                                 (unsigned long long)g_txPackets.exchange(0),
+                                 (unsigned long long)(g_txBytes.exchange(0) / 1024),
+                                 (long long)(sentNs / 1000000));
+                    std::fflush(stderr);
+                    nextMs = nowMs + 1000;
+                }
+            }
+        }
         if (result) {
             diag_.sendPacketSuccess.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -195,8 +250,11 @@ int Ngtcp2Connection::StreamOpenCb(ngtcp2_conn* /*conn*/, int64_t stream_id,
     bool bidi = (stream_id & 0x2) == 0;
     DBG_LOG("[StreamOpenCb] stream_id", stream_id, "bidi", bidi);
 
+    // weak_from_this() (not shared_from_this()) so a throw can never escape
+    // into ngtcp2's C callback: a callback only runs while Connect()/
+    // CreateServer() already own the connection, so the lock is non-empty.
     auto stream = std::shared_ptr<Ngtcp2Stream>(
-        new Ngtcp2Stream(self, stream_id));
+        new Ngtcp2Stream(self->weak_from_this().lock(), stream_id));
     {
         std::lock_guard<std::mutex> lk(self->mu_);
         auto it = self->streams_.find(stream_id);
@@ -274,9 +332,16 @@ int Ngtcp2Connection::DatagramRecvCb(ngtcp2_conn* /*conn*/, uint32_t /*flags*/,
     auto* self = static_cast<Ngtcp2Connection*>(user_data);
     if (!self) return 0;
     {
-        std::lock_guard<std::mutex> lk(self->mu_);
+        // Dedicated mutex (not mu_): datagram enqueue must not contend with
+        // stream callbacks / Drive's stream picking on mu_.
+        std::lock_guard<std::mutex> lk(self->datagramMu_);
+        // Edge-triggered wake: only the empty->non-empty transition needs to
+        // notify. When the queue was already non-empty (a burst), the
+        // consumer is either running (it re-checks the predicate under the
+        // mutex before parking) or about to check - no wake needed.
+        const bool wasEmpty = self->recvDatagrams_.empty();
         self->recvDatagrams_.emplace_back(data, data + datalen);
-        self->datagramCv_.notify_one();
+        if (wasEmpty) self->datagramCv_.notify_one();
     }
     return 0;
 }
@@ -314,7 +379,7 @@ int Ngtcp2Connection::RecvStreamDataCb(ngtcp2_conn* conn, uint32_t flags,
             // (or instead of) invoking the stream_open callback.
             bidi = (stream_id & 0x2) == 0;
             stream = std::shared_ptr<Ngtcp2Stream>(
-                new Ngtcp2Stream(self, stream_id));
+                new Ngtcp2Stream(self->weak_from_this().lock(), stream_id));
             self->streams_[stream_id] = stream;
             streamIsNew = true;
             if (std::getenv("HY2_QUIC_DEBUG")) {
@@ -356,12 +421,11 @@ int Ngtcp2Connection::RecvStreamDataCb(ngtcp2_conn* conn, uint32_t flags,
         self->readDirtyStreams_.push_back(stream.get());
     }
 
-    // Extend flow control windows so the peer can continue sending.
-    // Without these calls, the peer stalls after exhausting its initial budget.
-    if (datalen > 0) {
-        ngtcp2_conn_extend_max_stream_offset(conn, stream_id, datalen);
-        ngtcp2_conn_extend_max_offset(conn, datalen);
-    }
+    // NOTE: the receive window is NOT extended here. Credit is returned by
+    // Ngtcp2Stream::Read() -> ExtendReadCredit() for the bytes the application
+    // actually consumed. Extending on arrival (the previous >=1 MB per chunk
+    // behavior) let a slow reader's peer send without bound and made
+    // Ngtcp2Stream::readBuf_ grow at line rate.
 
     (void)offset;
     return 0;
@@ -988,6 +1052,22 @@ bool Ngtcp2Connection::InitClient(const ClientParams& params) {
     if (settings_.cc_algo == NGTCP2_CC_ALGO_BRUTAL && params_.quicCfg.BrutalRate > 0) {
         ngtcp2_conn_set_brutal_rate(conn_, params_.quicCfg.BrutalRate);
     }
+    // Keep the connection alive while the tunnel is idle.
+    //
+    // MaxIdleTimeout (30 s by default) has always been applied to the transport
+    // parameters, but nothing ever reset that timer: ngtcp2 disables keep-alive
+    // unless told otherwise (UINT64_MAX is its default), and KeepAlivePeriod was
+    // parsed, defaulted to 10 s and range-checked in Config::VerifyAndFill()
+    // and then never handed to the connection. So a tunnel that saw no traffic
+    // for 30 s hit the idle timeout and closed - silently, since nobody is
+    // watching for it. Client-side only, matching quic-go: the pings reset the
+    // server's idle timer as well, so one side pinging is enough.
+    if (params_.quicCfg.KeepAlivePeriod.ns > 0) {
+        ngtcp2_conn_set_keep_alive_timeout(
+            conn_,
+            static_cast<ngtcp2_duration>(params_.quicCfg.KeepAlivePeriod.Milliseconds()) *
+                NGTCP2_MILLISECONDS);
+    }
 
     DBG("client: conn created");
     if (QuicDebugEnabled()) {
@@ -1114,7 +1194,7 @@ void Ngtcp2Connection::InternalLoop() {
     auto diagPrintTime = std::chrono::steady_clock::now();
     static const bool diagEnabled = std::getenv("HY2_BW_DIAG") != nullptr;
     while (!stopLoop_ && !closed_) {
-        if (g_diagEnabled) diag_.loopCount.fetch_add(1, std::memory_order_relaxed);
+        if (Hy2DiagEnabled()) diag_.loopCount.fetch_add(1, std::memory_order_relaxed);
 
         // Periodic diagnostic print (every 1 second when HY2_BW_DIAG=1)
         if (diagEnabled) {
@@ -1125,6 +1205,7 @@ void Ngtcp2Connection::InternalLoop() {
                 diagPrintTime = now;
             }
         }
+        if (Hy2DiagEnabled()) ConnHeartbeat("client");
 
         // Event-driven wait: block until the socket has data, the wake pipe
         // signals a Stream::Write, or the nearest QUIC timer expires.
@@ -1138,7 +1219,36 @@ void Ngtcp2Connection::InternalLoop() {
 #else
         int wakeFd = clientWakeRead_;
 #endif
-        IoWaitResult res = IoWait(fd, wakeFd, GetExpiry());
+            IoWaitResult res;
+        {
+            static std::atomic<int64_t> gWaitNsAcc{0};
+            const auto w0 = std::chrono::steady_clock::now();
+            // Cap the wait at 100 ms. GetExpiry() returns time_point::max() when
+            // ngtcp2 has no timer armed - and without the pacer it sometimes arms none
+            // even while data waits to be sent, so the loop slept until a packet
+            // arrived (download fine, upload dead: nothing ever woke it).
+            {
+                const auto cap = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+                const auto expiry = GetExpiry();
+                res = IoWait(fd, wakeFd, expiry < cap ? expiry : cap);
+            }
+            if (Hy2DiagEnabled()) {
+                gWaitNsAcc.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - w0).count());
+                static std::mutex lrepMu; static int64_t lNextMs = 0;
+                const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (nowMs >= lNextMs) {
+                    std::lock_guard<std::mutex> rl(lrepMu);
+                    if (nowMs >= lNextMs) {
+                        std::fprintf(stderr, "[loop] 1s wait_ms=%lld (blocked waiting for events)\n",
+                                     (long long)(gWaitNsAcc.exchange(0) / 1000000));
+                        std::fflush(stderr);
+                        lNextMs = nowMs + 1000;
+                    }
+                }
+            }
+        }
         if (res == IoWaitResult::kError) break;
         if (stopLoop_ || closed_) break;
 
@@ -1169,7 +1279,7 @@ void Ngtcp2Connection::InternalLoop() {
                 int n = socket_->Recv(buf, sizeof(buf));
                 if (n <= 0) break;
                 gotAny = true;
-                if (g_diagEnabled) {
+                if (Hy2DiagEnabled()) {
                     diag_.recvPackets.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (!ReadPacketLocked(buf, static_cast<size_t>(n))) break;
@@ -1195,22 +1305,33 @@ void Ngtcp2Connection::InternalLoop() {
         // and retransmits scheduled by handle_expiry. Drive() bursts until
         // cwnd is exhausted (its internal loop keeps calling
         // ngtcp2_conn_writev_stream until the CC window is used up).
-        if (ConsumeTxPending()) {
-            if (g_diagEnabled) {
-                auto dStart = std::chrono::steady_clock::now();
-                Drive();
-                auto dEnd = std::chrono::steady_clock::now();
-                diag_.driveCalls.fetch_add(1, std::memory_order_relaxed);
-                diag_.driveNs.fetch_add(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(dEnd - dStart).count(),
-                    std::memory_order_relaxed);
-            } else {
-                Drive();
-            }
+        // Always drive: ACK/window updates owed after a receive, retransmits
+        // scheduled by the timer, and app writes all flush here. The old
+        // ConsumeTxPending() gate could miss the rx/timer paths (they do not
+        // always set the app-write flag first), which stalled the peer's ACK
+        // clock.
+        if (Hy2DiagEnabled()) {
+            auto dStart = std::chrono::steady_clock::now();
+            Drive();
+            auto dEnd = std::chrono::steady_clock::now();
+            diag_.driveCalls.fetch_add(1, std::memory_order_relaxed);
+            diag_.driveNs.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(dEnd - dStart).count(),
+                std::memory_order_relaxed);
+        } else {
+            Drive();
         }
 
         if (socket_) socket_->DrainTxQueue();
     }
+
+    // The loop has stopped, so this connection will never carry another byte.
+    // Release everything parked on it here rather than relying on an owner to
+    // call CloseWithError(): when the connection dies on its own - the idle
+    // timeout, a peer CONNECTION_CLOSE, a failed handle_expiry - nothing else is
+    // guaranteed to come along, and a reader parked on a dead connection stays
+    // parked forever. That is what used to hang the engine's teardown join.
+    WakeAllWaiters();
 }
 
 // ---------------------------------------------------------------------------
@@ -1222,7 +1343,9 @@ std::shared_ptr<IQuicStream> Ngtcp2Connection::OpenStream() {
 
     // Wait for handshake to complete (stream IDs unavailable before that)
     {
-        std::unique_lock<std::mutex> lk(mu_);
+        hy2::diag::LockTimer _hy2lt_1225("ngtcp2_connection:1225 mu_");
+          std::unique_lock<std::mutex> lk(mu_);
+          _hy2lt_1225.done();
         bool ok = handshakeCv_.wait_for(lk, handshakeTimeout_,
             [this] { return handshakeComplete_.load(std::memory_order_acquire) || closed_.load(); });
         if (!ok || (!handshakeComplete_ && closed_))
@@ -1250,16 +1373,21 @@ std::shared_ptr<IQuicStream> Ngtcp2Connection::OpenStream() {
         throw hy2::Error("failed to open stream: " + std::string(ngtcp2_strerror(rv)));
     }
 
-    auto stream = std::shared_ptr<Ngtcp2Stream>(new Ngtcp2Stream(this, streamId));
+    auto stream = std::shared_ptr<Ngtcp2Stream>(
+        new Ngtcp2Stream(shared_from_this(), streamId));
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        hy2::diag::LockTimer _hy2lt_1255("ngtcp2_connection:1255 mu_");
+          std::lock_guard<std::mutex> lk(mu_);
+          _hy2lt_1255.done();
         streams_[streamId] = stream;
     }
     return stream;
 }
 
 std::shared_ptr<IQuicStream> Ngtcp2Connection::AcceptStream() {
-    std::unique_lock<std::mutex> lk(acceptMu_);
+    hy2::diag::LockTimer _hy2lt_1262("ngtcp2_connection:1262 acceptMu_");
+      std::unique_lock<std::mutex> lk(acceptMu_);
+      _hy2lt_1262.done();
     acceptCv_.wait(lk, [this] {
         return !pendingAccepts_.empty() || closed_.load();
     });
@@ -1270,7 +1398,9 @@ std::shared_ptr<IQuicStream> Ngtcp2Connection::AcceptStream() {
 }
 
 std::shared_ptr<IQuicStream> Ngtcp2Connection::AcceptStreamFor(int timeoutMs) {
-    std::unique_lock<std::mutex> lk(acceptMu_);
+    hy2::diag::LockTimer _hy2lt_1273("ngtcp2_connection:1273 acceptMu_");
+      std::unique_lock<std::mutex> lk(acceptMu_);
+      _hy2lt_1273.done();
     DBG_LOG("[AcceptStreamFor] waiting", "timeout_ms", timeoutMs, "pending", pendingAccepts_.size());
     acceptCv_.wait_for(lk, std::chrono::milliseconds(timeoutMs), [this] {
         return !pendingAccepts_.empty() || closed_.load();
@@ -1283,7 +1413,9 @@ std::shared_ptr<IQuicStream> Ngtcp2Connection::AcceptStreamFor(int timeoutMs) {
 }
 
 std::shared_ptr<IQuicStream> Ngtcp2Connection::AcceptUniStream() {
-    std::unique_lock<std::mutex> lk(uniAcceptMu_);
+    hy2::diag::LockTimer _hy2lt_1286("ngtcp2_connection:1286 uniAcceptMu_");
+      std::unique_lock<std::mutex> lk(uniAcceptMu_);
+      _hy2lt_1286.done();
     uniAcceptCv_.wait(lk, [this] { return !pendingUniAccepts_.empty() || closed_.load(); });
     if (pendingUniAccepts_.empty()) return nullptr;
     auto s = std::move(pendingUniAccepts_.front());
@@ -1296,7 +1428,9 @@ std::shared_ptr<IQuicStream> Ngtcp2Connection::OpenUniStream() {
 
     // Wait for handshake to complete (stream IDs unavailable before that)
     {
-        std::unique_lock<std::mutex> lk(mu_);
+        hy2::diag::LockTimer _hy2lt_1299("ngtcp2_connection:1299 mu_");
+          std::unique_lock<std::mutex> lk(mu_);
+          _hy2lt_1299.done();
         bool ok = handshakeCv_.wait_for(lk, handshakeTimeout_,
             [this] { return handshakeComplete_.load(std::memory_order_acquire) || closed_.load(); });
         if (!ok || (!handshakeComplete_ && closed_))
@@ -1319,9 +1453,12 @@ std::shared_ptr<IQuicStream> Ngtcp2Connection::OpenUniStream() {
         throw hy2::Error("failed to open uni stream: " + std::string(ngtcp2_strerror(rv)));
     }
 
-    auto stream = std::shared_ptr<Ngtcp2Stream>(new Ngtcp2Stream(this, streamId));
+    auto stream = std::shared_ptr<Ngtcp2Stream>(
+        new Ngtcp2Stream(shared_from_this(), streamId));
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        hy2::diag::LockTimer _hy2lt_1324("ngtcp2_connection:1324 mu_");
+          std::lock_guard<std::mutex> lk(mu_);
+          _hy2lt_1324.done();
         streams_[streamId] = stream;
     }
     return stream;
@@ -1351,14 +1488,21 @@ void Ngtcp2Connection::SendDatagram(const uint8_t* p, size_t n) {
 
     if (n > cap) throw hy2::DatagramTooLargeError(static_cast<int64_t>(cap));
 
-    diag_.dgramTxCalls.fetch_add(1, std::memory_order_relaxed);
-
-    auto lockWaitStart = std::chrono::steady_clock::now();
+    // Diagnostics are gated on the cached flag: the default path must not pay
+    // atomic RMWs or clock reads per datagram (same rule as SendPacket).
+    const bool diag = Hy2DiagEnabled();
+    std::chrono::steady_clock::time_point lockWaitStart;
+    if (diag) {
+        diag_.dgramTxCalls.fetch_add(1, std::memory_order_relaxed);
+        lockWaitStart = std::chrono::steady_clock::now();
+    }
     BeginOpBlocking();
-    auto lockHoldStart = std::chrono::steady_clock::now();
-    diag_.dgramTxLockWaitNs.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(lockHoldStart - lockWaitStart).count(),
-        std::memory_order_relaxed);
+    if (diag) {
+        const auto lockHoldStart = std::chrono::steady_clock::now();
+        diag_.dgramTxLockWaitNs.fetch_add(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(lockHoldStart - lockWaitStart).count(),
+            std::memory_order_relaxed);
+    }
 
     uint8_t buf[1500];
     ngtcp2_path* path = GetPath();
@@ -1369,15 +1513,20 @@ void Ngtcp2Connection::SendDatagram(const uint8_t* p, size_t n) {
     {
         struct OpGuard {
             Ngtcp2Connection* c;
+            bool timing;
             std::chrono::steady_clock::time_point start;
             ~OpGuard() {
-                auto end = std::chrono::steady_clock::now();
-                c->diag_.dgramTxLockHoldNs.fetch_add(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count(),
-                    std::memory_order_relaxed);
+                if (timing) {
+                    auto end = std::chrono::steady_clock::now();
+                    c->diag_.dgramTxLockHoldNs.fetch_add(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count(),
+                        std::memory_order_relaxed);
+                }
                 c->EndOp();
             }
-        } guard{this, std::chrono::steady_clock::now()};
+        } guard{this, diag,
+                diag ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{}};
         rv = ngtcp2_conn_writev_datagram(
             conn_, path, &pi, buf, sizeof(buf), &accepted, 0, 0,
             &vec, 1, NowTimestamp());
@@ -1399,35 +1548,66 @@ void Ngtcp2Connection::SendDatagram(const uint8_t* p, size_t n) {
         }
     }
     if (rv < 0) {
-        diag_.dgramTxRvNeg.fetch_add(1, std::memory_order_relaxed);
+        if (diag) diag_.dgramTxRvNeg.fetch_add(1, std::memory_order_relaxed);
         throw hy2::Error("send datagram failed: " + std::to_string(static_cast<int>(rv)));
     }
     if (rv == 0) {
-        diag_.dgramTxRv0.fetch_add(1, std::memory_order_relaxed);
+        if (diag) diag_.dgramTxRv0.fetch_add(1, std::memory_order_relaxed);
         throw hy2::Error("datagram not accepted (connection not ready or buffer full)");
     }
     if (!accepted) {
-        diag_.dgramTxAccepted0.fetch_add(1, std::memory_order_relaxed);
+        if (diag) diag_.dgramTxAccepted0.fetch_add(1, std::memory_order_relaxed);
         throw hy2::Error("datagram not accepted (accepted=0)");
     }
-    diag_.dgramTxSuccess.fetch_add(1, std::memory_order_relaxed);
+    if (diag) diag_.dgramTxSuccess.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::vector<uint8_t> Ngtcp2Connection::ReceiveDatagram() {
-    std::unique_lock<std::mutex> lk(mu_);
+    hy2::diag::LockTimer _hy2lt_1417("ngtcp2_connection:1417 datagramMu_");
+      std::unique_lock<std::mutex> lk(datagramMu_);
+      _hy2lt_1417.done();
     datagramCv_.wait(lk, [this] { return !recvDatagrams_.empty() || closed_.load(); });
     if (recvDatagrams_.empty()) throw hy2::Error("connection closed");
-    auto d = std::move(recvDatagrams_.front());
-    recvDatagrams_.erase(recvDatagrams_.begin());
+    std::vector<uint8_t> d = std::move(recvDatagrams_.front());
+    recvDatagrams_.pop_front();
     return d;
 }
 
-void Ngtcp2Connection::CloseWithError(uint64_t errorCode, const std::string& reason) {
-    if (closed_.exchange(true)) return;
+// Consumption-driven receive-window credit (see the header comment).
+void Ngtcp2Connection::ExtendReadCredit(int64_t stream_id, uint64_t credit) {
+    if (credit == 0 || !conn_ || closed_) return;
 
-    // Unblock the IO loop's poll immediately (it checks closed_ after
-    // every wakeup).
-    WakeUp();
+    BeginOpBlocking();
+    {
+        struct OpGuard {
+            Ngtcp2Connection* c;
+            ~OpGuard() { c->EndOp(); }
+        } guard{this};
+        // Connection-level window: keeps the aggregate bound tied to what the
+        // application actually consumed (a stalled reader cannot accumulate
+        // connection window for other streams).
+        ngtcp2_conn_extend_max_offset(conn_, credit);
+        // Stream-level window. Returns 0 (no-op) when the stream is already
+        // gone from ngtcp2's map, so an app holding a closed stream is safe.
+        (void)ngtcp2_conn_extend_max_stream_offset(conn_, stream_id, credit);
+    }
+    // The MAX_STREAM_DATA/MAX_DATA update is owed to the peer now; wake the
+    // IO loop so it is emitted with the next packet (ACK-clocked).
+    WakeUpOnData();
+}
+
+void Ngtcp2Connection::CloseWithError(uint64_t errorCode, const std::string& reason) {
+    // Deliberately NOT an early return when closed_ is already set.
+    //
+    // A connection can end its own life: the QUIC idle timeout and a peer
+    // CONNECTION_CLOSE both set closed_ from inside the IO loop. This call is
+    // the only thing that releases the threads parked on the connection, so
+    // returning early here left every stream read, accept wait and datagram
+    // consumer blocked forever - the engine's teardown join then never returned
+    // and the UI sat on "disconnecting" with no way out. WakeAllWaiters() is
+    // idempotent, so repeating it costs a few notifies.
+    closed_.store(true);
+    WakeAllWaiters();
 
     // Diagnostic: connection summary
     if (QuicDebugEnabled()) {
@@ -1477,12 +1657,17 @@ void Ngtcp2Connection::SetCongestionControl(std::shared_ptr<cc::CongestionContro
     IQuicConnection::SetCongestionControl(std::move(cc));
     if (congestion_) {
         congestion_->SetRTTStatsProvider(&rttStats_);
-        // The in-stack controller runs the actual sending: arm its Brutal
-        // rate with the value the handshake negotiated (min(peer Rx, our Tx))
-        // when this connection was created as NGTCP2_CC_ALGO_BRUTAL.
-        if (conn_ && settings_.cc_algo == NGTCP2_CC_ALGO_BRUTAL &&
-            congestion_->BrutalRate() > 0) {
+        // A non-zero negotiated rate means the fixed-rate sender was selected
+        // after the handshake. The server only learns the client's declared
+        // receive rate in the auth request, i.e. after the connection was
+        // created with the configured default controller, so switch the
+        // in-stack algorithm to Brutal here (ngtcp2_conn_set_brutal_rate does
+        // the switch + arming; it used to be a no-op for non-Brutal conns,
+        // which silently left the server on BBR and the declared rate
+        // unenforced).
+        if (conn_ && congestion_->BrutalRate() > 0) {
             ngtcp2_conn_set_brutal_rate(conn_, congestion_->BrutalRate());
+            settings_.cc_algo = NGTCP2_CC_ALGO_BRUTAL;
         }
     }
 }
@@ -1531,7 +1716,11 @@ void Ngtcp2Connection::WakeUpOnData() {
     // tx-pending flag. Repeated Write() calls inside one send burst
     // therefore cost one atomic exchange instead of one syscall + one
     // redundant poll() wakeup each.
-    if (!MarkTxPendingIfNotSet()) return;
+    // Always wake the loop: the wake pipe's send is non-blocking and can fail,
+    // and since the tx-pending flag is an edge trigger that one lost wake used to
+    // park the loop until a PTO timer (seconds) - uploads then crawled while
+    // download kept working. One extra non-blocking send per Write is cheap.
+    MarkTxPendingIfNotSet();
     if (serverLoopRunning_.load(std::memory_order_relaxed)) {
         rxCv_.notify_all();
         return;
@@ -1561,7 +1750,9 @@ void Ngtcp2Connection::Drive() {
     {
         std::vector<std::shared_ptr<Ngtcp2Stream>> zombies;
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            hy2::diag::LockTimer _hy2lt_1564("ngtcp2_connection:1564 mu_");
+              std::lock_guard<std::mutex> lk(mu_);
+              _hy2lt_1564.done();
             zombies.swap(zombieStreams_);
         }
     }
@@ -1615,7 +1806,9 @@ void Ngtcp2Connection::Drive() {
         const uint8_t* dataPtr = nullptr;
 
         if (!cur) {
-            std::lock_guard<std::mutex> lk(mu_);
+            hy2::diag::LockTimer _hy2lt_1618("ngtcp2_connection:1618 mu_");
+              std::lock_guard<std::mutex> lk(mu_);
+              _hy2lt_1618.done();
             Ngtcp2Stream* s = PickWritableStreamLocked();
             if (s) {
                 auto it = streams_.find(s->StreamID());
@@ -1666,18 +1859,32 @@ void Ngtcp2Connection::Drive() {
         ngtcp2_tstamp ts = NowTimestamp();
         ngtcp2_ssize wdatalen = 0;
         std::chrono::steady_clock::time_point dWvStart;
-        if (g_diagEnabled) dWvStart = std::chrono::steady_clock::now();
+        if (Hy2DiagEnabled()) dWvStart = std::chrono::steady_clock::now();
         ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
             conn_, path, &pi, buf, sizeof(buf),
             &wdatalen, flags, stream_id, &datav, 1, ts);
-        if (g_diagEnabled) {
+        if (Hy2DiagEnabled()) {
             dWvNs += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - dWvStart).count();
         }
 
         if (nwrite == 0) {
             dLoopEnd = std::chrono::steady_clock::now();
+            g_driveRv0.fetch_add(1, std::memory_order_relaxed);
             DBG_LOG("[Drive] ngtcp2 returned 0 (congestion/flow-control blocked), stream_id", stream_id);
+            if (QuicDebugEnabled() || Hy2DiagEnabled()) {
+                ngtcp2_tstamp e = ngtcp2_conn_get_expiry2(conn_);
+                ngtcp2_conn_info ci;
+                ngtcp2_conn_get_conn_info(conn_, &ci);
+                std::fprintf(stderr,
+                             "[dbg] Drive rv=0 sid=%lld datalen=%zu cwnd=%llu inflight=%llu "
+                             "expiry_delta_ms=%lld\n",
+                             (long long)stream_id, datalen,
+                             (unsigned long long)ci.cwnd,
+                             (unsigned long long)ci.bytes_in_flight,
+                             (long long)((int64_t)e - (int64_t)NowTimestamp()) / 1000000);
+                std::fflush(stderr);
+            }
             break;  // congestion/flow-control blocked
         }
         if (QuicDebugEnabled()) {
@@ -1745,7 +1952,7 @@ void Ngtcp2Connection::Drive() {
     // when one is registered) and refresh the cached snapshot. Skipped
     // entirely otherwise: ngtcp2_conn_get_conn_info copies a large struct.
     ngtcp2_conn_info cinfo;
-    if (congestion_ || g_diagEnabled) {
+    if (congestion_ || Hy2DiagEnabled()) {
         ngtcp2_conn_get_conn_info(conn_, &cinfo);
         if (congestion_) {
             ReportAckedPackets(&cinfo);
@@ -1753,7 +1960,7 @@ void Ngtcp2Connection::Drive() {
             rttStats_.Update(Duration::FromNanos(cinfo.smoothed_rtt));
         }
         cinfo2_ = cinfo;
-        if (g_diagEnabled) {
+        if (Hy2DiagEnabled()) {
             diag_.lastCwnd.store(cinfo.cwnd, std::memory_order_relaxed);
             diag_.lastInflight.store(cinfo.bytes_in_flight, std::memory_order_relaxed);
             diag_.lastBytesSent.store(cinfo.bytes_sent, std::memory_order_relaxed);
@@ -1761,7 +1968,7 @@ void Ngtcp2Connection::Drive() {
         }
     }
 
-    if (g_diagEnabled) {
+    if (Hy2DiagEnabled()) {
         auto tNow = std::chrono::steady_clock::now();
         const auto* s = socket_ ? socket_.get() : sendSocket_;
         sockStats_ = s ? s->GetStats() : UdpSocket::Stats();
@@ -1779,8 +1986,8 @@ void Ngtcp2Connection::Drive() {
             (long long)0,
             (long long)std::chrono::duration_cast<std::chrono::milliseconds>(tNow - dOpStart).count(),
             (long long)(readPktNsAcc_ / 1000000),
-            (long long)(sendNsAcc_ / 1000000),
-            (unsigned long)cinfo.cwnd, (unsigned long)cinfo.bytes_in_flight,
+            (long long)(sendNsBreakdown_ / 1000000),
+            (unsigned long long)cinfo.cwnd, (unsigned long)cinfo.bytes_in_flight,
             (unsigned long)(cinfo.smoothed_rtt / 1000),
             (unsigned long)cinfo.pkt_lost,
             (unsigned long)cinfo.pkt_sent, (unsigned long)cinfo.pkt_recv,
@@ -1788,7 +1995,7 @@ void Ngtcp2Connection::Drive() {
             sockStats_.txQueueCount);
     }
     readPktNsAcc_ = 0;
-    sendNsAcc_ = 0;
+    sendNsBreakdown_ = 0;
 
     // Drain any queued packets from WOULDBLOCK earlier
     if (socket_) socket_->DrainTxQueue();
@@ -1800,7 +2007,7 @@ void Ngtcp2Connection::Drive() {
 bool Ngtcp2Connection::ReadPacketLocked(const uint8_t* data, size_t len) {
     if (closed_ || !conn_) return false;
 
-    if (g_diagEnabled) {
+    if (Hy2DiagEnabled()) {
         g_rxPackets.fetch_add(1, std::memory_order_relaxed);
         g_rxBytes.fetch_add(static_cast<int>(len), std::memory_order_relaxed);
         diag_.readPktCalls.fetch_add(1, std::memory_order_relaxed);
@@ -1818,7 +2025,13 @@ bool Ngtcp2Connection::ReadPacketLocked(const uint8_t* data, size_t len) {
     ngtcp2_pkt_info pi{};
 
     TTRACE(1, (int64_t)len);
+    std::chrono::steady_clock::time_point rpStart;
+    if (Hy2DiagEnabled()) rpStart = std::chrono::steady_clock::now();
     int rv = ngtcp2_conn_read_pkt(conn_, path, &pi, data, len, NowTimestamp());
+    if (Hy2DiagEnabled()) {
+        readPktNsAcc_ += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - rpStart).count();
+    }
     TTRACE(2, rv);
     if (QuicDebugEnabled()) {
         bool hs = conn_ ? ngtcp2_conn_get_handshake_completed2(conn_) : false;
@@ -1835,13 +2048,29 @@ bool Ngtcp2Connection::ReadPacketLocked(const uint8_t* data, size_t len) {
         // and a reconnect reusing the same UDP 4-tuple gets a fresh
         // connection instead of being routed into a dead one.
         if (rv == NGTCP2_ERR_IDLE_CLOSE || rv == NGTCP2_ERR_DRAINING) {
+            // Terminal (peer CONNECTION_CLOSE, or the idle timeout fired).
+            // Setting closed_ alone is NOT enough: every waiter parks on a
+            // predicate over closed_ and only re-checks it when notified, so
+            // without this wake the accept / uni-accept / datagram loops and
+            // the stream readers stay blocked for the rest of the process
+            // lifetime. HySession::Serve() joins those loops, so the session
+            // worker never returned and its detached children were never torn
+            // down: measured ~9 leaked threads and ~9MB per closed connection,
+            // never reclaimed even after minutes of idle. Same reasoning as
+            // the CloseWithError comment above; WakeAllWaiters is idempotent.
             closed_ = true;
+            WakeAllWaiters();
             return false;
         }
         return true;
     }
 
-    if (ngtcp2_conn_get_handshake_completed2(conn_)) {
+    // Short-circuit on the cached flag first: once the handshake has been
+    // observed complete this whole block is a no-op, and the old form ran
+    // exchange(true) - a locked read-modify-write - on every received packet
+    // for the entire life of the connection.
+    if (!handshakeComplete_.load(std::memory_order_relaxed) &&
+        ngtcp2_conn_get_handshake_completed2(conn_)) {
         if (!handshakeComplete_.exchange(true)) {
             g_handshakeCompleted = true;
             if (QuicDebugEnabled()) {
@@ -1906,6 +2135,49 @@ void Ngtcp2Connection::FlushReadNotifyBatch() {
     readDirtyStreams_.clear();
 }
 
+void Ngtcp2Connection::WakeAllWaiters() {
+    // Unblock the IO loop's poll (a no-op once it has exited: the wake pipe's
+    // send is non-blocking).
+    WakeUp();
+    // Release everything that parks on closed_ (datagram consumer, accept
+    // waiters, stream readers/writers). The empty critical sections only
+    // synchronize with the predicate check before a waiter parks - a bare
+    // notify_all could race with one that has not entered wait() yet.
+    {
+        std::lock_guard<std::mutex> lk(datagramMu_);
+    }
+    datagramCv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(acceptMu_);
+    }
+    acceptCv_.notify_all();
+    {
+        std::lock_guard<std::mutex> lk(uniAcceptMu_);
+    }
+    uniAcceptCv_.notify_all();
+    NotifyStreamsClosed();
+}
+
+void Ngtcp2Connection::NotifyStreamsClosed() {
+    // Snapshot under mu_ (the IO thread mutates streams_ from ngtcp2
+    // callbacks), then notify outside every connection lock: the streams take
+    // their own mutexes and wake their waiters.
+    std::vector<std::shared_ptr<Ngtcp2Stream>> streams;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        // Zombies are streams ngtcp2 already closed: they stay in the map only
+        // until the next Drive(), so both lists are needed to reach every
+        // stream the application may still hold. (Everything parked in
+        // pendingAccepts_ is also in streams_; nothing to do for those lists.)
+        streams.reserve(streams_.size() + zombieStreams_.size());
+        for (auto& kv : streams_) streams.push_back(kv.second);
+        for (auto& s : zombieStreams_) streams.push_back(s);
+    }
+    for (auto& s : streams) {
+        s->OnStreamClose(0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server-side worker loop
 //
@@ -1920,7 +2192,9 @@ void Ngtcp2Connection::FlushReadNotifyBatch() {
 void Ngtcp2Connection::EnqueueRx(const uint8_t* data, size_t len) {
     bool wake = false;
     {
-        std::lock_guard<std::mutex> lk(rxMu_);
+        hy2::diag::LockTimer _hy2lt_1923("ngtcp2_connection:1923 rxMu_");
+          std::lock_guard<std::mutex> lk(rxMu_);
+          _hy2lt_1923.done();
         if (rxQueue_.size() >= kMaxRxQueue) {
             // Bound memory. QUIC recovers from drops via retransmission.
             return;
@@ -1970,9 +2244,16 @@ void Ngtcp2Connection::StopServerLoop() {
 
 void Ngtcp2Connection::Abort() {
     closed_.store(true);
-    // WakeUp() notifies the server worker loop or writes the client wake
-    // pipe, so both variants observe closed_ and stop promptly.
-    WakeUp();
+    WakeAllWaiters();
+}
+
+void Ngtcp2Connection::DetachFromListener() {
+    // Best effort by contract: the caller (Ngtcp2Listener::Close) has already
+    // stopped this connection's worker loop, so only an application thread
+    // inside Stream::Write() can still be reading these.
+    wakeWrite_ = nullptr;
+    sendSocket_ = nullptr;
+    listener_ = nullptr;
 }
 
 void Ngtcp2Connection::ServerLoop() {
@@ -1993,9 +2274,12 @@ void Ngtcp2Connection::ServerLoop() {
                 diagPrintTime = now;
             }
         }
+        if (Hy2DiagEnabled()) ConnHeartbeat("server");
 
         {
-            std::unique_lock<std::mutex> lk(rxMu_);
+            hy2::diag::LockTimer _hy2lt_1998("ngtcp2_connection:1998 rxMu_");
+              std::unique_lock<std::mutex> lk(rxMu_);
+              _hy2lt_1998.done();
             if (rxQueue_.empty()) {
                 auto deadline = std::chrono::steady_clock::now() + kMaxWait;
                 auto expiry = GetExpiry();
@@ -2015,7 +2299,9 @@ void Ngtcp2Connection::ServerLoop() {
         OnUdpRecvBatch(batch);
         // Recycle the datagram buffers for the next listener handoff.
         if (!batch.empty()) {
-            std::lock_guard<std::mutex> lk(rxMu_);
+            hy2::diag::LockTimer _hy2lt_2018("ngtcp2_connection:2018 rxMu_");
+              std::lock_guard<std::mutex> lk(rxMu_);
+              _hy2lt_2018.done();
             for (auto& pkt : batch) {
                 if (rxPool_.size() >= kMaxRxPool) break;
                 rxPool_.push_back(std::move(pkt));
@@ -2028,9 +2314,12 @@ void Ngtcp2Connection::ServerLoop() {
         if (TimerOverdue()) {
             OnTimeout();
         }
-        if (ConsumeTxPending()) {
-            Drive();
-        }
+        // Always drive: a received ACK frees cwnd and may owe an ACK, and the
+        // old ConsumeTxPending() gate dropped exactly those drives (incoming
+        // packets never set the app-write flag), so the peer's ACKs were only
+        // answered on the next timer/PTO - throughput collapsed to one packet
+        // per ACK-timeout on both sides.
+        Drive();
         if (sendSocket_) {
             sendSocket_->DrainTxQueue();
         }
@@ -2038,6 +2327,20 @@ void Ngtcp2Connection::ServerLoop() {
 
     serverLoopRunning_.store(false);
     rxCv_.notify_all();
+
+    // The server-side counterpart of the WakeAllWaiters() at the end of
+    // InternalLoop(). This loop exits for every reason a connection can die -
+    // the peer's CONNECTION_CLOSE, the idle timeout, a failed handle_expiry,
+    // serverLoopStop_ - and once it has stopped nothing else will release the
+    // threads parked on this connection. Without this the server-side accept /
+    // uni-accept / datagram waiters and the stream readers stayed parked for
+    // the rest of the process lifetime; because HySession::Serve() joins the
+    // accept and datagram loops, the whole session worker and its detached
+    // children were never torn down. Measured on the local server: ~9 threads
+    // and ~9MB leaked per closed connection, never reclaimed even after
+    // minutes of idle. The client path always had this; the server path did
+    // not.
+    WakeAllWaiters();
 }
 
 void Ngtcp2Connection::OnTimeout() {
@@ -2064,6 +2367,9 @@ void Ngtcp2Connection::OnTimeout() {
                          ElapsedMs(), rv);
         }
         closed_ = true;
+        // Same as the read path above: closed_ is only a predicate for the
+        // parked waiters, so they must be woken or they never observe it.
+        WakeAllWaiters();
         return;
     }
 
@@ -2149,7 +2455,9 @@ Ngtcp2Connection::QuicStats Ngtcp2Connection::GetQuicStats() const {
     qs.maxTxUdpPayloadSize = 0; // ngtcp2 1.25.0 removed this field from conn_info
 
     // Count streams
-    std::lock_guard<std::mutex> lk(mu_);
+    hy2::diag::LockTimer _hy2lt_2152("ngtcp2_connection:2152 mu_");
+      std::lock_guard<std::mutex> lk(mu_);
+      _hy2lt_2152.done();
     qs.streamsOpen = streams_.size();
     uint64_t active = 0;
     for (auto& kv : streams_) {
@@ -2158,6 +2466,22 @@ Ngtcp2Connection::QuicStats Ngtcp2Connection::GetQuicStats() const {
     qs.streamsActive = active;
 
     return qs;
+}
+
+// IQuicConnection: the same counters, in the backend-neutral shape the rate
+// controller uses (it must not know what a QuicStats is).
+QuicStatsSnapshot Ngtcp2Connection::GetStatsSnapshot() const {
+    const QuicStats qs = GetQuicStats();
+    QuicStatsSnapshot out;
+    out.bytesSent = qs.bytesSent;
+    out.bytesReceived = qs.bytesReceived;
+    out.packetsSent = qs.packetsSent;
+    out.packetsReceived = qs.packetsReceived;
+    out.packetsLost = qs.packetsLost;
+    out.streamsActive = qs.streamsActive;
+    out.streamsOpen = qs.streamsOpen;
+    out.smoothedRttMs = qs.smoothedRttUs / 1000.0;  // us -> ms
+    return out;
 }
 
 Ngtcp2Connection::SocketTxStats Ngtcp2Connection::GetSocketTxStats() const {
@@ -2173,6 +2497,37 @@ Ngtcp2Connection::SocketTxStats Ngtcp2Connection::GetSocketTxStats() const {
         sts.drainWouldBlock = s.txDrainWouldBlock;
     }
     return sts;
+}
+
+void Ngtcp2Connection::ConnHeartbeat(const char* role) {
+    static std::chrono::steady_clock::time_point next{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(1);
+    ngtcp2_conn_info ci{};
+    uint64_t cwnd = 0, inflight = 0;
+    if (conn_) {
+        ngtcp2_conn_get_conn_info(conn_, &ci);
+        cwnd = ci.cwnd;
+        inflight = ci.bytes_in_flight;
+    }
+    std::fprintf(stderr,
+                 "[hb] role=%s closed=%d loops=%llu rx=%llu tx=%llu drives=%llu rv0=%llu "
+                 "cwnd=%llu inflight=%llu\n",
+                 role, (int)closed_.load(),
+                 (unsigned long long)diag_.loopCount.load(),
+                 (unsigned long long)diag_.recvPackets.load(),
+                 (unsigned long long)diag_.sendPacketSuccess.load(),
+                 (unsigned long long)diag_.driveCalls.load(),
+                 (unsigned long long)g_driveRv0.load(), (unsigned long long)cwnd,
+                 (unsigned long long)inflight);
+    std::fflush(stderr);
+    std::vector<std::shared_ptr<Ngtcp2Stream>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        for (auto& kv : streams_) snapshot.push_back(kv.second);
+    }
+    for (auto& s : snapshot) s->DiagPrint();
 }
 
 void Ngtcp2Connection::PrintStats() const {
@@ -2299,6 +2654,15 @@ void Ngtcp2Connection::Diag::Reset() {
 Ngtcp2Connection::~Ngtcp2Connection() {
     StopServerLoop();
     StopInternalLoop();
+    // The application can still hold streams of this connection (a flow whose
+    // Client was dropped from the pool). Release their waiters before the
+    // object goes away: the weak back-reference dies with us, so from here on
+    // Read()/Write() would either park forever or try to notify a dead loop.
+    // WakeAllWaiters() rather than NotifyStreamsClosed() so every path that ends
+    // a connection's life releases the same set of waiters - the datagram and
+    // accept waiters hold a shared_ptr, so they cannot be parked here, but the
+    // invariant is worth keeping uniform.
+    WakeAllWaiters();
     CloseClientWakePipe();
     if (conn_) {
         ngtcp2_conn_del(conn_);
@@ -2323,22 +2687,3 @@ Ngtcp2Connection::~Ngtcp2Connection() {
 }
 
 } // namespace hy2::quic_backend
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

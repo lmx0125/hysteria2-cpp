@@ -12,12 +12,15 @@ TrafficStatsServer::TrafficStatsServer(const std::string& secret)
 bool TrafficStatsServer::LogTraffic(const std::string& id, uint64_t tx, uint64_t rx) {
     std::lock_guard<std::mutex> lk(mutex_);
 
-    // Check if user is kicked
-    if (kicked_.count(id) && kicked_[id]) return false;
+    // One lookup instead of three. This runs once per relayed UDP datagram and
+    // per 32KB of relayed TCP, so the string-keyed probes are the hot part.
+    // (The old `kicked_.count(id) && kicked_[id]` also *inserted* a false entry
+    // for every id it had never seen, growing the map without bound.)
+    if (kicked_.find(id) != kicked_.end()) return false;
 
-    auto& s = stats_[id];
-    s.tx += tx;
-    s.rx += rx;
+    auto it = stats_.try_emplace(id).first;
+    it->second.tx += tx;
+    it->second.rx += rx;
     return true;
 }
 
@@ -84,7 +87,7 @@ int TrafficStatsServer::KickUsers(const std::string& ids) {
             id = id.substr(start, end - start + 1);
         }
         if (!id.empty()) {
-            kicked_[id] = true;
+            kicked_.insert(id);
             count++;
         }
     }

@@ -19,7 +19,7 @@ constexpr size_t kUdpMessageChanSize = 1024;
 class UdpIO {
 public:
     virtual ~UdpIO() = default;
-    virtual std::shared_ptr<const proto::UDPMessage> ReceiveMessage() = 0; // throws on closed
+    virtual std::shared_ptr<proto::UDPMessage> ReceiveMessage() = 0; // throws on closed
     virtual void SendMessage(uint8_t* buf, size_t bufLen, const proto::UDPMessage& msg) = 0;
 };
 
@@ -28,7 +28,7 @@ class UdpConn : public HyUDPConn {
 public:
     uint32_t ID = 0;
     frag::Defragger D;
-    std::shared_ptr<Channel<std::shared_ptr<const proto::UDPMessage>>> ReceiveCh;
+    std::shared_ptr<Channel<std::shared_ptr<proto::UDPMessage>>> ReceiveCh;
     // Shared ownership: an outstanding relay connection must keep its IO (and
     // through it the QUIC connection) alive. With a raw pointer, destroying
     // the Client while sessions were still in use left Send()/Receive()
@@ -65,7 +65,7 @@ private:
 
     void run();
     void closeCleanup();
-    void feed(std::shared_ptr<const proto::UDPMessage> msg);
+    void feed(std::shared_ptr<proto::UDPMessage> msg);
     void closeConn(const std::shared_ptr<UdpConn>& conn);
 
     std::shared_ptr<UdpIO> io_;

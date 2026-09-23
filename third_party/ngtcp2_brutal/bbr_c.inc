@@ -5,7 +5,7 @@
  */
 static void ngtcp2_cc_brutal_update_cwnd(ngtcp2_cc_brutal *brutal,
                                          ngtcp2_conn_stat *cstat) {
-  uint64_t min_cwnd = 2 * cstat->max_tx_udp_payload_size;
+  uint64_t min_cwnd = 64 * 1024; /* hy2: floor the window: rate*srtt is only a few packets at low RTT (loopback/LAN) and ACK-jitter then throttles the flow; 64 KiB keeps the ACK clock fed and is far below the real-path rate*RTT window. */
   uint64_t target;
 
   if (brutal->rate == 0 || cstat->smoothed_rtt == 0) {

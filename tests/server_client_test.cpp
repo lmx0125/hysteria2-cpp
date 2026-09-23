@@ -218,9 +218,9 @@ struct CountingClientIO : public hy2::client::UdpIO {
 
     explicit CountingClientIO(MockQuicConnection& c) : conn(c) {}
 
-    std::shared_ptr<const UDPMessage> ReceiveMessage() override {
+    std::shared_ptr<UDPMessage> ReceiveMessage() override {
         auto v = conn.ReceiveDatagram(); // blocks / throws on close
-        return std::make_shared<const UDPMessage>(ParseUDPMessage(v));
+        return std::make_shared<UDPMessage>(ParseUDPMessage(v));
     }
     void SendMessage(uint8_t* buf, size_t bufLen, const UDPMessage& msg) override {
         sendCalls++;
@@ -284,8 +284,7 @@ HY_TEST(ClientUdpSessionIdsAndRouting)
 }
 
 HY_TEST(ClientUdpSendAutoFragmentation)
-{
-    MockQuicConnection conn;
+{    MockQuicConnection conn;
     conn.maxDatagramPayloadSize_ = 60; // force fragmentation
     CountingClientIO io(conn);
     auto ioPtr = std::shared_ptr<CountingClientIO>(&io, [](CountingClientIO*) {});
@@ -326,6 +325,39 @@ HY_TEST(ClientUdpSendAutoFragmentation)
     HY_CHECK(assembled->FragCount == 1); // reassembled message
     HY_CHECK(assembled->Data == big);
     HY_CHECK(pktId > 0); // random non-zero packet id on fragmentation
+}
+
+// H5: UdpConn::Send reuses a thread-local message + serialization buffer.
+// Different payload sizes on the same thread must not leak stale bytes from
+// a previous datagram (the reused buffer is only as large as needed).
+HY_TEST(ClientUdpSendReusesThreadLocalBuffer)
+{
+    MockQuicConnection conn;
+    CountingClientIO io(conn);
+    auto ioPtr = std::shared_ptr<CountingClientIO>(&io, [](CountingClientIO*) {});
+    auto mgr = ClientUdpSessionManager::Create(ioPtr);
+    auto c = mgr->NewUDP();
+
+    const std::vector<size_t> sizes = {1100, 37, 512};
+    for (size_t s : sizes) {
+        std::vector<uint8_t> payload(s);
+        for (size_t i = 0; i < s; i++) {
+            payload[i] = static_cast<uint8_t>(i * 31 + s);
+        }
+        c->Send(payload.data(), payload.size(), "9.9.9.9:9");
+    }
+
+    auto dgrams = conn.SentDatagrams();
+    HY_CHECK_EQ(dgrams.size(), sizes.size());
+    for (size_t i = 0; i < sizes.size(); i++) {
+        auto m = ParseUDPMessage(dgrams[i]);
+        HY_CHECK_EQ(m.Data.size(), sizes[i]);
+        std::vector<uint8_t> expected(sizes[i]);
+        for (size_t j = 0; j < sizes[i]; j++) {
+            expected[j] = static_cast<uint8_t>(j * 31 + sizes[i]);
+        }
+        HY_CHECK(m.Data == expected);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,7 +604,7 @@ HY_TEST(ServerHandleTCPRequestProxying)
 HY_TEST(QuicConfigDisableChromeParrotDefault)
 {
     // Official Go: DisableChromeParrot bool // Chrome QUIC fingerprint parroting is on by default.
-    // Default is false ¡ú ChromeParrot ON ¡ú zero-length SCID
+    // Default is false ï¿½ï¿½ ChromeParrot ON ï¿½ï¿½ zero-length SCID
     QuicConfig cfg;
     HY_CHECK_EQ(cfg.DisableChromeParrot, false);
 }
@@ -595,8 +627,8 @@ HY_TEST(QuicConfigDisableChromeParrotSemantic)
     // The semantic matches Go:
     //   ChromeParrot = !c.config.QUICConfig.DisableChromeParrot
     // So:
-    //   DisableChromeParrot=false ¡ú ChromeParrot=true ¡ú zero-length SCID
-    //   DisableChromeParrot=true  ¡ú ChromeParrot=false ¡ú 8-byte SCID
+    //   DisableChromeParrot=false ï¿½ï¿½ ChromeParrot=true ï¿½ï¿½ zero-length SCID
+    //   DisableChromeParrot=true  ï¿½ï¿½ ChromeParrot=false ï¿½ï¿½ 8-byte SCID
     QuicConfig cfg;
 
     cfg.DisableChromeParrot = false;
