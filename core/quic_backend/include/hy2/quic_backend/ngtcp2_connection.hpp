@@ -279,6 +279,17 @@ public:
     // client uses zero-length SCIDs, so SCIDs cannot be compared).
     const ngtcp2_cid& ServerScid() const { return scid_; }
 
+    // The DCID carried by the client's very FIRST Initial: a value the CLIENT
+    // picked, before it could possibly know our SCID. Every packet of the same
+    // initial flight still carries it - QUIC splits the ClientHello across
+    // several Initials, and a retransmission reuses the same one - so while the
+    // client has not yet seen our reply this is the ONLY thing identifying the
+    // connection. Comparing against ServerScid() alone made the listener treat
+    // each of those as a brand-new connection (see ngtcp2_listener.cpp).
+    const ngtcp2_cid& OriginalDcid() const {
+        return transportParams_.original_dcid;
+    }
+
     // Serializes ALL ngtcp2 entry points (Drive/OnUdpRecv/OnTimeout +
     // app-thread OpenStream/SendDatagram/CloseWithError). ngtcp2 requires
     // monotonically increasing timestamps per connection, so these must

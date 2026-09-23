@@ -292,15 +292,32 @@ void Ngtcp2Listener::HandlePacket(const uint8_t* data, size_t len,
         isInitial && ngtcp2_accept(&hd, data, len) == 0;
 
     if (existing && parsedInitial) {
-        // A client Initial always carries the server's SCID as its DCID.
-        // Comparing the DCID distinguishes a retransmitted Initial of the
-        // existing connection from a brand-new connection reusing the same
-        // UDP 4-tuple. (The hy2 client uses a zero-length SCID, so the old
-        // SCID comparison wrongly treated every reconnect as a retransmit.)
+        // Which DCID an Initial carries depends on whether the client has
+        // already seen our reply:
+        //   - after that, it is our SCID (the client learned it);
+        //   - before that, it is the DCID the CLIENT chose itself, which is
+        //     what original_dcid records.
+        // Both must count as "this connection". Comparing against the SCID
+        // alone meant every packet of an unanswered initial flight - and QUIC
+        // splits the ClientHello across several Initials, so there are several
+        // - looked like a brand-new connection on a reused 4-tuple: the server
+        // aborted the half-finished handshake and rebuilt it, over and over, so
+        // it could never complete. Measured on a 100 ms RTT path: 20
+        // replacements per connect attempt, ~25 packets relayed in 40 s, the
+        // client stuck retransmitting its Initial until it gave up.
+        // A genuine reconnect (a lazy client that dropped its connection and
+        // came back on the same 4-tuple) picks a NEW random DCID, so it still
+        // matches neither and is still replaced.
         const ngtcp2_cid& oldServerScid = existing->ServerScid();
-        bool sameConn = hd.dcid.datalen == oldServerScid.datalen &&
-                        memcmp(oldServerScid.data, hd.dcid.data,
-                               hd.dcid.datalen) == 0;
+        const ngtcp2_cid& oldOriginalDcid = existing->OriginalDcid();
+        // A zero-length DCID never identifies a connection: without this guard
+        // two empty CIDs would compare equal and merge unrelated peers.
+        auto cidEq = [](const ngtcp2_cid& a, const ngtcp2_cid& b) {
+            return a.datalen > 0 && a.datalen == b.datalen &&
+                   memcmp(a.data, b.data, a.datalen) == 0;
+        };
+        const bool sameConn =
+            cidEq(hd.dcid, oldServerScid) || cidEq(hd.dcid, oldOriginalDcid);
         if (!sameConn || existing->IsClosed()) {
             if (QuicDebugEnabled()) {
                 std::fprintf(stderr,
