@@ -279,6 +279,85 @@ int UdpSocket::SendTo(const uint8_t* data, size_t len,
 #endif
 }
 
+// UDP_SEND_MSG_SIZE lives in ws2ipdef.h (pulled in by ws2tcpip.h) on the
+// Windows 10 2004+ SDKs. Define it locally so an older SDK still compiles -
+// EnableTxSegmentation() probes the option at runtime and fails cleanly there.
+#ifndef UDP_SEND_MSG_SIZE
+#define UDP_SEND_MSG_SIZE 2
+#endif
+
+bool UdpSocket::EnableTxSegmentation(size_t segLen) {
+#ifdef _WIN32
+    if (fd_ < 0 || segLen == 0) return false;
+    // Escape hatch: segmentation offload is a driver/NIC feature and a buggy
+    // implementation would corrupt packets rather than fail loudly, so it must
+    // be possible to turn off without a rebuild.
+    static const bool disabled = std::getenv("HY2_NO_TX_SEG") != nullptr;
+    if (disabled) return false;
+    // The option is PER SOCKET, and the server shares one socket across every
+    // connection. So the first size wins: letting a second connection re-set it
+    // would re-segment the first connection's in-flight batch by the wrong
+    // boundary and corrupt its packets. A connection whose packets do not match
+    // the established size simply never batches.
+    if (txSegEnabled_) return txSegLen_ == segLen;
+    DWORD want = static_cast<DWORD>(segLen);
+    if (setsockopt(fd_, IPPROTO_UDP, UDP_SEND_MSG_SIZE,
+                   reinterpret_cast<const char*>(&want), sizeof(want)) != 0) {
+        return false;
+    }
+    // Read it back: a stack that does not implement the offload may accept the
+    // setsockopt and ignore it, and silently sending an oversized datagram
+    // would be far worse than not batching at all.
+    DWORD got = 0;
+    int gotLen = sizeof(got);
+    if (getsockopt(fd_, IPPROTO_UDP, UDP_SEND_MSG_SIZE,
+                   reinterpret_cast<char*>(&got), &gotLen) != 0 ||
+        got != want) {
+        return false;
+    }
+    txSegLen_ = segLen;
+    txSegEnabled_ = true;
+    return true;
+#else
+    (void)segLen;
+    return false;
+#endif
+}
+
+int UdpSocket::SendSegmented(const uint8_t* data, size_t totalLen,
+                             const struct sockaddr* to, socklen_t tolen) {
+#ifdef _WIN32
+    if (fd_ < 0 || !txSegEnabled_ || txSegLen_ == 0) return -1;
+    if (totalLen == 0 || totalLen % txSegLen_ != 0) return -1;
+
+    WSABUF wb;
+    wb.buf = const_cast<CHAR*>(reinterpret_cast<const CHAR*>(data));
+    wb.len = static_cast<ULONG>(totalLen);
+
+    WSAMSG msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.name = const_cast<LPSOCKADDR>(to);
+    msg.namelen = to ? static_cast<INT>(tolen) : 0;
+    msg.lpBuffers = &wb;
+    msg.dwBufferCount = 1;
+
+    DWORD sent = 0;
+    if (WSASendMsg(static_cast<SOCKET>(fd_), &msg, 0, &sent, nullptr, nullptr) ==
+        SOCKET_ERROR) {
+        return -1;
+    }
+    if (sent > 0) {
+        // Counted per datagram, like the single-packet path, so the existing
+        // stats stay comparable across both.
+        stats_.txSendSuccess += sent / txSegLen_;
+    }
+    return static_cast<int>(sent);
+#else
+    (void)data; (void)totalLen; (void)to; (void)tolen;
+    return -1;
+#endif
+}
+
 bool UdpSocket::DrainOnePacket(TxPacket& pkt) {
     if (fd_ < 0) return false;
 #ifdef _WIN32

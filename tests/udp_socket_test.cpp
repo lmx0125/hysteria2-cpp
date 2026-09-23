@@ -238,4 +238,84 @@ HY_TEST(UdpSocket_ConcurrentDrainKeepsQueueConsistent)
     HY_CHECK(!tx.HasQueuedPackets());
 }
 
+// ---------------------------------------------------------------------------
+// TX segmentation (Windows UDP segmentation offload).
+//
+// Written so it is meaningful on a machine without the offload too: there the
+// API must refuse, not fake it. The delivery count is the assertion that
+// matters - it is what proves one call really produced N datagrams.
+// ---------------------------------------------------------------------------
+HY_TEST(UdpSocket_SegmentationContract)
+{
+    const size_t kSeg = 1350;
+    const size_t kCount = 4;
+
+    // A fixed port outside the ephemeral range: other tests in this binary bind
+    // ephemeral ports, and a reused ephemeral port would deliver our datagrams
+    // to the wrong socket (both sides set SO_REUSEADDR).
+    UdpSocket rx;
+    HY_CHECK(rx.Bind("127.0.0.1", 39011));
+
+    UdpSocket tx;
+    HY_CHECK(tx.Bind("127.0.0.1", 0)); // unconnected: the server's shape
+
+    struct sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(39011);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const struct sockaddr* toSa = reinterpret_cast<const struct sockaddr*>(&to);
+
+    std::vector<uint8_t> buf(kSeg * kCount, 0x6b);
+    std::vector<uint8_t> rxBuf(4096);
+
+    if (!tx.EnableTxSegmentation(kSeg)) {
+        HY_CHECK(!tx.TxSegmentationEnabled());
+        HY_CHECK_EQ(tx.SendSegmented(buf.data(), kSeg * kCount, toSa, sizeof(to)), -1);
+        return;
+    }
+    HY_CHECK(tx.TxSegmentationEnabled());
+    HY_CHECK_EQ(tx.TxSegmentSize(), kSeg);
+
+    // The option is per-socket, and the server shares one socket across every
+    // connection: a second caller asking for a different size must be refused,
+    // or it would re-segment the first connection's in-flight batch by the
+    // wrong boundary and corrupt its packets.
+    HY_CHECK(!tx.EnableTxSegmentation(kSeg + 8));
+    HY_CHECK_EQ(tx.TxSegmentSize(), kSeg);
+
+    // A length that is not a whole number of segments must be refused.
+    HY_CHECK_EQ(tx.SendSegmented(buf.data(), kSeg * kCount + 1, toSa, sizeof(to)), -1);
+
+    // One call must produce exactly kCount datagrams of exactly kSeg bytes.
+    HY_CHECK_EQ(tx.SendSegmented(buf.data(), kSeg * kCount, toSa, sizeof(to)),
+                static_cast<int>(kSeg * kCount));
+
+    size_t got = 0, badSize = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (got + badSize < kCount && std::chrono::steady_clock::now() < deadline) {
+        const int n = rx.RecvFrom(rxBuf.data(), rxBuf.size(), nullptr, nullptr);
+        if (n <= 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        if (static_cast<size_t>(n) == kSeg) ++got; else ++badSize;
+    }
+    HY_CHECK_EQ(got, kCount);
+    HY_CHECK_EQ(badSize, static_cast<size_t>(0));
+
+    // The server shares one socket between batched bulk data and single ACK
+    // packets, so a plain send must still work once segmentation is on.
+    const uint8_t one[kSeg] = {0};
+    HY_CHECK_EQ(tx.SendTo(one, kSeg, toSa, sizeof(to)), static_cast<int>(kSeg));
+
+    size_t plain = 0;
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (plain == 0 && std::chrono::steady_clock::now() < deadline) {
+        const int n = rx.RecvFrom(rxBuf.data(), rxBuf.size(), nullptr, nullptr);
+        if (n > 0 && static_cast<size_t>(n) == kSeg) ++plain;
+        else std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    HY_CHECK_EQ(plain, static_cast<size_t>(1));
+}
+
 #endif // HY2_WITH_QUIC_BACKEND

@@ -163,7 +163,88 @@ int Ngtcp2Connection::SendPktCb(ngtcp2_conn* /*conn*/,
     return 0;
 }
 
+// Batching entry point - see the header for the design and the invariants.
+// Caller holds opMu_ (every caller of SendPacket does), so txBatch_ needs no
+// lock of its own.
 bool Ngtcp2Connection::SendPacket(const uint8_t* data, size_t len) {
+    UdpSocket* sock = socket_ ? socket_.get() : sendSocket_;
+    if (!sock || len == 0) return SendPacketNow(data, len);
+
+    // Learn the segment size once, from the first full-size packet. The option
+    // is per-socket and the server shares one socket across all connections, so
+    // the socket owns the value (first caller wins) and this connection just
+    // mirrors it - a connection whose packets differ simply never batches.
+    if (!txSegTried_ && len >= kTxBatchMinSeg) {
+        txSegTried_ = true;
+        (void)sock->EnableTxSegmentation(len);
+        txSegLen_ = sock->TxSegmentationEnabled() ? sock->TxSegmentSize() : 0;
+    }
+
+    if (txSegLen_ == 0 || len != txSegLen_) {
+        // Not batchable: flush what is pending first, or this packet would
+        // overtake earlier ones.
+        if (!FlushTxBatch()) return false;
+        return SendPacketNow(data, len);
+    }
+
+    if (txBatchCount_ >= kTxBatchMax && !FlushTxBatch()) return false;
+    txBatch_.insert(txBatch_.end(), data, data + len);
+    if (++txBatchCount_ >= kTxBatchMax) return FlushTxBatch();
+    return true;
+}
+
+bool Ngtcp2Connection::FlushTxBatch() {
+    if (txBatchCount_ == 0) return true;
+    const size_t count = txBatchCount_;
+    const size_t total = txBatch_.size();
+    txBatchCount_ = 0;
+
+    UdpSocket* sock = socket_ ? socket_.get() : sendSocket_;
+    int rc = -1;
+    if (sock && txSegLen_ > 0 && total == count * txSegLen_ &&
+        sock->TxSegmentationEnabled()) {
+        std::chrono::steady_clock::time_point t0;
+        if (Hy2DiagEnabled()) t0 = std::chrono::steady_clock::now();
+        if (socket_) {
+            rc = sock->SendSegmented(txBatch_.data(), total, nullptr, 0);
+        } else if (remoteAddrLen_ > 0) {
+            rc = sock->SendSegmented(
+                txBatch_.data(), total,
+                reinterpret_cast<const struct sockaddr*>(&remoteAddr_),
+                remoteAddrLen_);
+        }
+        if (Hy2DiagEnabled()) {
+            const auto dt = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            sendNsAcc_ += dt;
+            sendNsBreakdown_ += dt;
+        }
+    }
+
+    if (rc == static_cast<int>(total)) {
+        txBatch_.clear();
+        if (Hy2DiagEnabled()) {
+            g_txPackets.fetch_add(count, std::memory_order_relaxed);
+            g_txBytes.fetch_add(static_cast<int>(total), std::memory_order_relaxed);
+            diag_.sendPacketSuccess.fetch_add(count, std::memory_order_relaxed);
+        }
+        return true;
+    }
+
+    // Segmentation refused, short, or unavailable. Fall back to one syscall per
+    // packet: a stack that rejects the batched call must not lose data. The
+    // packets are still in txBatch_, in order.
+    bool allOk = true;
+    if (txSegLen_ > 0) {
+        for (size_t off = 0; off + txSegLen_ <= txBatch_.size(); off += txSegLen_) {
+            if (!SendPacketNow(txBatch_.data() + off, txSegLen_)) allOk = false;
+        }
+    }
+    txBatch_.clear();
+    return allOk;
+}
+
+bool Ngtcp2Connection::SendPacketNow(const uint8_t* data, size_t len) {
     // All counters/timers below are diagnostics: gated on the cached flag so
     // the default path has no atomic RMWs and no clock reads per packet.
     std::chrono::steady_clock::time_point spStart;
@@ -1546,6 +1627,10 @@ void Ngtcp2Connection::SendDatagram(const uint8_t* p, size_t n) {
                 SendPacket(buf, static_cast<size_t>(rv));
             }
         }
+        // Flush inside the opMu_ scope: this datagram's packet may have been
+        // appended to the batch (it is a full-size packet whenever it fits one
+        // MTU), and the throws below must not leave it buffered.
+        FlushTxBatch();
     }
     if (rv < 0) {
         if (diag) diag_.dgramTxRvNeg.fetch_add(1, std::memory_order_relaxed);
@@ -1638,6 +1723,10 @@ void Ngtcp2Connection::CloseWithError(uint64_t errorCode, const std::string& rea
             if (nwrite > 0) {
                 SendPacket(buf, static_cast<size_t>(nwrite));
             }
+            // Must go out before the grace sleep and the socket close below: a
+            // packet left in the batch would be lost, and this close packet is
+            // the last thing the peer ever sees.
+            FlushTxBatch();
         }
         // Give the close packet a moment to leave before tearing down.
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1996,6 +2085,11 @@ void Ngtcp2Connection::Drive() {
     }
     readPktNsAcc_ = 0;
     sendNsBreakdown_ = 0;
+
+    // Emit the batch built by this drive burst. Drive holds opMu_ for its whole
+    // body, so this is the natural burst boundary - and leaving it unflushed
+    // would strand those packets until the next burst.
+    FlushTxBatch();
 
     // Drain any queued packets from WOULDBLOCK earlier
     if (socket_) socket_->DrainTxQueue();

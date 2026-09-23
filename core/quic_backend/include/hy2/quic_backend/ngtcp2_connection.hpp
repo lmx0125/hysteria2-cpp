@@ -341,7 +341,24 @@ private:
                          const ngtcp2_path* path, uint32_t flags, void* user_data);
     // Send one datagram through the right socket (client: connected socket;
     // server: listener's socket via sendto).
+    //
+    // This is the buffering entry point: when the target socket supports TX
+    // segmentation and the packet matches the batch's segment size, the packet
+    // is appended to txBatch_ instead of being sent, and the whole batch goes
+    // out as one segmented syscall. Otherwise any pending batch is flushed
+    // first (packet order must not change) and the packet is sent on its own.
+    // Returns false only when a send actually failed.
     bool SendPacket(const uint8_t* data, size_t len);
+
+    // The immediate, unbatched send: one syscall per packet. Kept separate so
+    // the batching layer can fall back to it - both when a packet does not fit
+    // the batch and when a segmented send is rejected or short.
+    bool SendPacketNow(const uint8_t* data, size_t len);
+
+    // Emit any buffered packets. No-op when the batch is empty. Returns false
+    // if the segmented send failed and the per-packet fallback also failed.
+    bool FlushTxBatch();
+
     void BuildPath(ngtcp2_path_storage* ps);
     void InternalLoop();
     // Write the wake byte to whichever pipe is valid (client pipe first,
@@ -434,6 +451,30 @@ private:
 
     // Non-owning: listener's socket used for server-side sends.
     UdpSocket* sendSocket_ = nullptr;
+
+    // ---- TX segmentation batch -------------------------------------------
+    // Windows can split one WSASendMsg into N datagrams of a fixed size
+    // (UDP_SEND_MSG_SIZE). A bulk transfer emits packets of one identical
+    // length (measured: 99.8% of them are exactly 1444 B), so batching those
+    // into one syscall cuts the dominant per-packet cost - the send syscall is
+    // 72-80% of this stack's per-packet CPU, and measured 2.3x lower per
+    // datagram at 16 per call.
+    //
+    // All of this is guarded by opMu_: every caller of SendPacket (Drive,
+    // SendDatagram, CloseWithError) holds it, so no lock is needed here.
+    //
+    // The segment size is LEARNED from the first full-size packet rather than
+    // hard-coded, because it depends on the negotiated max_udp_payload_size and
+    // the frame layout - a fixed constant would silently stop matching after
+    // either changed.
+    static constexpr size_t kTxBatchMax = 16;
+    // Smallest packet treated as a bulk packet worth locking a segment size to;
+    // below QUIC's 1200-byte floor a "full-size" guess would be wrong.
+    static constexpr size_t kTxBatchMinSeg = 1200;
+    bool txSegTried_ = false;   // EnableTxSegmentation attempted on this socket
+    size_t txSegLen_ = 0;       // 0 = batching disabled (unsupported or not yet seen)
+    std::vector<uint8_t> txBatch_;
+    size_t txBatchCount_ = 0;
 
     // Non-owning: listener's wake pipe write-end for waking the event loop.
     // Set by Ngtcp2Listener when the connection is registered.

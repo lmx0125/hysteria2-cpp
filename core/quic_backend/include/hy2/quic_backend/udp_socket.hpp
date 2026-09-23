@@ -50,6 +50,30 @@ public:
     int SendTo(const uint8_t* data, size_t len,
                const struct sockaddr* to, socklen_t tolen);
 
+    // ---- TX segmentation (Windows UDP segmentation offload) ----------------
+    // Measured on loopback: a plain send of 1350 B costs ~15-16 us, which is
+    // 72-80% of this stack's per-packet CPU - the send syscall is the single
+    // dominant cost. Windows 10 2004+ can split one send into N datagrams of a
+    // fixed size (UDP_SEND_MSG_SIZE), turning N syscalls into one; measured
+    // 2.3x lower per-datagram cost at 16 per call.
+    //
+    // EnableTxSegmentation() asks the stack and reads the value back, so a
+    // platform that ignores the option reports failure instead of silently
+    // mis-sending. Plain Send()/SendTo() keep working on a segmented socket -
+    // verified on this platform, and required because the server shares one
+    // socket between batched bulk data and single ACK packets.
+    bool EnableTxSegmentation(size_t segLen);
+    bool TxSegmentationEnabled() const { return txSegEnabled_; }
+    size_t TxSegmentSize() const { return txSegLen_; }
+
+    // One syscall for `totalLen` bytes, sent as totalLen/TxSegmentSize()
+    // datagrams of that size, all to `to` (nullptr = connected socket).
+    // Returns the number of bytes accepted, or -1. Valid only when
+    // segmentation is enabled and totalLen is a non-zero multiple of the
+    // segment size; callers must fall back to per-packet sends on -1.
+    int SendSegmented(const uint8_t* data, size_t totalLen,
+                      const struct sockaddr* to, socklen_t tolen);
+
     // Drain queued packets (non-blocking). Call after Drive() or on EPOLLOUT.
     // Returns number of bytes still queued (0 = empty).
     size_t DrainTxQueue();
@@ -126,6 +150,10 @@ private:
 
     int fd_ = -1;
     size_t maxDatagramSize_ = 1350;
+    // TX segmentation state. Set once by EnableTxSegmentation() and only read
+    // afterwards, so no synchronization is needed on the send path.
+    bool txSegEnabled_ = false;
+    size_t txSegLen_ = 0;
     // Fast-path guard for DrainTxQueue(): true iff txQueue_ is non-empty.
     // Written under txMu_ (release), read without the lock (acquire).
     //
