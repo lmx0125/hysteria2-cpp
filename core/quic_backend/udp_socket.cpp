@@ -179,7 +179,7 @@ int UdpSocket::Send(const uint8_t* data, size_t len) {
 #ifdef _WIN32
     int n = send(fd_, reinterpret_cast<const char*>(data),
                  static_cast<int>(len), 0);
-    if (n >= 0) { stats_.txSendSuccess++; return n; }
+    if (n >= 0) { txSendSuccess_.Inc(); return n; }
     int werr = WSAGetLastError();
     // WOULDBLOCK: queue the packet
     if (werr == WSAEWOULDBLOCK) {
@@ -189,11 +189,11 @@ int UdpSocket::Send(const uint8_t* data, size_t len) {
             pkt.data.assign(data, data + len);
             pkt.hasDest = false;
             EnqueueTxLocked(std::move(pkt));
-            stats_.txQueueCount++;
-            if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
+            queueStats_.count++;
+            if (txQueue_.size() > queueStats_.peak) queueStats_.peak = txQueue_.size();
             return static_cast<int>(len); // report success to caller
         }
-        stats_.txQueueDrop++;
+        queueStats_.drop++;
         return -1;
     }
     if (std::getenv("HY2_BW_DIAG")) {
@@ -202,7 +202,7 @@ int UdpSocket::Send(const uint8_t* data, size_t len) {
     return -1;
 #else
     ssize_t n = ::send(fd_, data, len, MSG_DONTWAIT);
-    if (n >= 0) { stats_.txSendSuccess++; return static_cast<int>(n); }
+    if (n >= 0) { txSendSuccess_.Inc(); return static_cast<int>(n); }
     // WOULDBLOCK: queue the packet
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
         std::lock_guard<std::mutex> lk(txMu_);
@@ -211,11 +211,11 @@ int UdpSocket::Send(const uint8_t* data, size_t len) {
             pkt.data.assign(data, data + len);
             pkt.hasDest = false;
             EnqueueTxLocked(std::move(pkt));
-            stats_.txQueueCount++;
-            if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
+            queueStats_.count++;
+            if (txQueue_.size() > queueStats_.peak) queueStats_.peak = txQueue_.size();
             return static_cast<int>(len); // report success to caller
         }
-        stats_.txQueueDrop++;
+        queueStats_.drop++;
         return -1;
     }
     if (errno == EINTR) {
@@ -232,7 +232,7 @@ int UdpSocket::SendTo(const uint8_t* data, size_t len,
 #ifdef _WIN32
     int n = sendto(fd_, reinterpret_cast<const char*>(data),
                    static_cast<int>(len), 0, to, tolen);
-    if (n >= 0) { stats_.txSendSuccess++; return n; }
+    if (n >= 0) { txSendSuccess_.Inc(); return n; }
     // WOULDBLOCK: queue the packet
     if (WSAGetLastError() == WSAEWOULDBLOCK) {
         std::lock_guard<std::mutex> lk(txMu_);
@@ -243,17 +243,17 @@ int UdpSocket::SendTo(const uint8_t* data, size_t len,
             pkt.tolen = tolen;
             pkt.hasDest = true;
             EnqueueTxLocked(std::move(pkt));
-            stats_.txQueueCount++;
-            if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
+            queueStats_.count++;
+            if (txQueue_.size() > queueStats_.peak) queueStats_.peak = txQueue_.size();
             return static_cast<int>(len);
         }
-        stats_.txQueueDrop++;
+        queueStats_.drop++;
         return -1;
     }
     return -1;
 #else
     ssize_t n = ::sendto(fd_, data, len, MSG_DONTWAIT, to, tolen);
-    if (n >= 0) { stats_.txSendSuccess++; return static_cast<int>(n); }
+    if (n >= 0) { txSendSuccess_.Inc(); return static_cast<int>(n); }
     // WOULDBLOCK: queue the packet
     if (errno == EAGAIN || errno == EWOULDBLOCK) {
         std::lock_guard<std::mutex> lk(txMu_);
@@ -264,11 +264,11 @@ int UdpSocket::SendTo(const uint8_t* data, size_t len,
             pkt.tolen = tolen;
             pkt.hasDest = true;
             EnqueueTxLocked(std::move(pkt));
-            stats_.txQueueCount++;
-            if (txQueue_.size() > stats_.txQueuePeak) stats_.txQueuePeak = txQueue_.size();
+            queueStats_.count++;
+            if (txQueue_.size() > queueStats_.peak) queueStats_.peak = txQueue_.size();
             return static_cast<int>(len);
         }
-        stats_.txQueueDrop++;
+        queueStats_.drop++;
         return -1;
     }
     if (errno == EINTR) {
@@ -349,7 +349,7 @@ int UdpSocket::SendSegmented(const uint8_t* data, size_t totalLen,
     if (sent > 0) {
         // Counted per datagram, like the single-packet path, so the existing
         // stats stay comparable across both.
-        stats_.txSendSuccess += sent / txSegLen_;
+        txSendSuccess_.Add(sent / txSegLen_);
     }
     return static_cast<int>(sent);
 #else
@@ -370,9 +370,9 @@ bool UdpSocket::DrainOnePacket(TxPacket& pkt) {
         n = send(fd_, reinterpret_cast<const char*>(pkt.data.data()),
                  static_cast<int>(pkt.data.size()), 0);
     }
-    if (n >= 0) { stats_.txDrainSuccess++; return true; }
-    if (WSAGetLastError() == WSAEWOULDBLOCK) { stats_.txDrainWouldBlock++; return false; }
-    stats_.txDrainError++;
+    if (n >= 0) { txDrainSuccess_.Inc(); return true; }
+    if (WSAGetLastError() == WSAEWOULDBLOCK) { txDrainWouldBlock_.Inc(); return false; }
+    txDrainError_.Inc();
     return false; // error — drop packet
 #else
     ssize_t n;
@@ -382,9 +382,9 @@ bool UdpSocket::DrainOnePacket(TxPacket& pkt) {
     } else {
         n = ::send(fd_, pkt.data.data(), pkt.data.size(), MSG_DONTWAIT);
     }
-    if (n >= 0) { stats_.txDrainSuccess++; return true; }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) { stats_.txDrainWouldBlock++; return false; }
-    stats_.txDrainError++;
+    if (n >= 0) { txDrainSuccess_.Inc(); return true; }
+    if (errno == EAGAIN || errno == EWOULDBLOCK) { txDrainWouldBlock_.Inc(); return false; }
+    txDrainError_.Inc();
     return false; // error — drop packet
 #endif
 }
@@ -441,13 +441,31 @@ bool UdpSocket::HasQueuedPackets() const {
 }
 
 UdpSocket::Stats UdpSocket::GetStats() const {
-    std::lock_guard<std::mutex> lk(txMu_);
-    return stats_;
+    Stats out;
+    {
+        std::lock_guard<std::mutex> lk(txMu_);
+        out.txQueueCount = queueStats_.count;
+        out.txQueueDrop = queueStats_.drop;
+        out.txQueuePeak = queueStats_.peak;
+    }
+    // The per-packet counters are striped relaxed atomics: no lock is needed and
+    // none is taken, so reading them never perturbs the send path.
+    out.txSendSuccess = txSendSuccess_.Sum();
+    out.txDrainSuccess = txDrainSuccess_.Sum();
+    out.txDrainWouldBlock = txDrainWouldBlock_.Sum();
+    out.txDrainError = txDrainError_.Sum();
+    out.rxPackets = rxPackets_.Sum();
+    return out;
 }
 
 void UdpSocket::ResetStats() {
     std::lock_guard<std::mutex> lk(txMu_);
-    stats_ = {};
+    queueStats_ = {};
+    txSendSuccess_.Reset();
+    txDrainSuccess_.Reset();
+    txDrainWouldBlock_.Reset();
+    txDrainError_.Reset();
+    rxPackets_.Reset();
 }
 
 int UdpSocket::Recv(uint8_t* buf, size_t buflen) {
@@ -466,11 +484,11 @@ int UdpSocket::RecvFrom(uint8_t* buf, size_t buflen,
 #ifdef _WIN32
     int n = recvfrom(fd_, reinterpret_cast<char*>(buf),
                      static_cast<int>(buflen), 0, from, fromlen);
-    if (n > 0) stats_.rxPackets++;
+    if (n > 0) rxPackets_.Inc();
     return n;
 #else
     int n = ::recvfrom(fd_, buf, buflen, 0, from, fromlen);
-    if (n > 0) stats_.rxPackets++;
+    if (n > 0) rxPackets_.Inc();
     return n;
 #endif
 }
@@ -566,11 +584,7 @@ UdpSocket::BufferSizes UdpSocket::GetActualBufferSizes() const {
 
 void UdpSocket::PrintStats(const char* tag) const {
     auto bs = GetActualBufferSizes();
-    Stats stats;
-    {
-        std::lock_guard<std::mutex> lk(txMu_);
-        stats = stats_;
-    }
+    const Stats stats = GetStats();
     std::fprintf(stderr,
         "[%s] TX: success=%lu queue=%lu drop=%lu drain_ok=%lu drain_wb=%lu drain_err=%lu peak=%zu\n"
         "[%s] RX: packets=%lu\n"

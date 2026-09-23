@@ -318,4 +318,68 @@ HY_TEST(UdpSocket_SegmentationContract)
     HY_CHECK_EQ(plain, static_cast<size_t>(1));
 }
 
+// ---------------------------------------------------------------------------
+// The per-packet counters are bumped by every connection's worker thread on a
+// socket they all share. That used to be a plain non-atomic `++` - a data race
+// against the diagnostics reader, and a lost-update bug. The counters are now
+// cache-line striped relaxed atomics; this checks the total is exact with many
+// concurrent senders, which a broken stripe index would break.
+//
+// The assertion is against the number of sends that actually succeeded rather
+// than the number attempted: a send that hits a full socket buffer is queued (or
+// dropped) and legitimately does not count as a send.
+// ---------------------------------------------------------------------------
+HY_TEST(UdpSocket_CountersExactUnderConcurrentSenders)
+{
+    UdpSocket rx;
+    HY_CHECK(rx.Bind("127.0.0.1", 0));
+    const uint16_t port = rx.LocalPort();
+
+    UdpSocket tx;
+    HY_CHECK(tx.Bind("127.0.0.1", 0)); // unconnected: the server's shape
+
+    struct sockaddr_in to{};
+    to.sin_family = AF_INET;
+    to.sin_port = htons(port);
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    const struct sockaddr* toSa = reinterpret_cast<const struct sockaddr*>(&to);
+
+    constexpr int kThreads = 8;
+    constexpr int kPerThread = 2000;
+
+    std::atomic<uint64_t> okSends{0};
+    std::atomic<bool> stop{false};
+    std::vector<uint8_t> rxBuf(2048);
+
+    // Drain concurrently so the socket buffer does not fill and turn sends into
+    // queued ones - the test is about counting, not about backpressure.
+    std::thread drainer([&] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            DrainReceiver(rx, rxBuf);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+
+    std::vector<std::thread> senders;
+    for (int t = 0; t < kThreads; ++t) {
+        senders.emplace_back([&] {
+            uint8_t payload[64] = {0};
+            for (int i = 0; i < kPerThread; ++i) {
+                if (tx.SendTo(payload, sizeof(payload), toSa, sizeof(to)) >= 0) {
+                    okSends.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& th : senders) th.join();
+
+    stop.store(true, std::memory_order_relaxed);
+    drainer.join();
+
+    HY_CHECK_EQ(tx.GetStats().txSendSuccess, okSends.load());
+    // Sanity: the workload really did send a substantial number of datagrams,
+    // so an exact match above is meaningful rather than trivially 0 == 0.
+    HY_CHECK(okSends.load() > static_cast<uint64_t>(kThreads) * kPerThread / 2);
+}
+
 #endif // HY2_WITH_QUIC_BACKEND

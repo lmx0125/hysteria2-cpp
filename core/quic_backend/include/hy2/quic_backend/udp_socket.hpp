@@ -25,6 +25,56 @@
 namespace hy2::quic_backend {
 
 // ---------------------------------------------------------------------------
+// StripedCounter: a per-packet counter that does not turn one cache line into a
+// cross-core battleground.
+//
+// The server hands ONE UdpSocket to every connection, so the send paths of all
+// its worker threads bump the same counters. As a plain `uint64_t++` that was
+// both a data race (undefined behaviour, against the diagnostics reader) and a
+// cache-line ping-pong: every send from every core had to take exclusive
+// ownership of that one line.
+//
+// Each thread claims its own stripe on first use, so concurrent increments never
+// share a line; only the reader sums them. Relaxed is enough - these are
+// diagnostics, nothing is ordered against them, and the sum is approximate by
+// nature anyway.
+// ---------------------------------------------------------------------------
+class StripedCounter {
+public:
+    void Add(uint64_t v) { Stripe().fetch_add(v, std::memory_order_relaxed); }
+    void Inc() { Add(1); }
+
+    uint64_t Sum() const {
+        uint64_t s = 0;
+        for (const auto& st : stripes_) {
+            s += st.v.load(std::memory_order_relaxed);
+        }
+        return s;
+    }
+    void Reset() {
+        for (auto& st : stripes_) st.v.store(0, std::memory_order_relaxed);
+    }
+
+private:
+    // Power of two so the modulo is a mask. 16 covers the connection counts this
+    // server is used with; more threads than stripes just share one.
+    static constexpr size_t kStripes = 16;
+    struct alignas(64) Stripe {
+        std::atomic<uint64_t> v{0};
+    };
+    Stripe stripes_[kStripes];
+
+    std::atomic<uint64_t>& Stripe() {
+        static thread_local const size_t idx = NextIndex();
+        return stripes_[idx % kStripes].v;
+    }
+    static size_t NextIndex() {
+        static std::atomic<size_t> next{0};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // UdpSocket: cross-platform UDP socket with non-blocking I/O and tx_queue.
 // ---------------------------------------------------------------------------
 class UdpSocket {
@@ -109,6 +159,11 @@ public:
     bool HasQueuedPackets() const;
 
     // Monitoring counters for performance analysis.
+    //
+    // This is the snapshot type returned by GetStats(); it is not where the
+    // per-packet fields are stored. Those live in StripedCounter members (see
+    // below) because every connection's worker thread bumps them on a socket
+    // they all share.
     struct Stats {
         uint64_t txSendSuccess = 0;      // send() returned success
         uint64_t txQueueCount = 0;       // packets queued on WOULDBLOCK
@@ -169,13 +224,28 @@ private:
     // empty (one wasted lock acquire), never false when the queue is non-empty
     // (which would strand a packet). Every writer holds txMu_.
     std::atomic<bool> txQueued_{false};
-    // Guards txQueue_ and the diagnostic counters. The hot send path only
-    // takes this lock when the kernel buffer is full (rare), so concurrent
-    // senders (one worker thread per server connection) do not serialize.
+    // Guards txQueue_ and the queue counters. The hot send path only takes this
+    // lock when the kernel buffer is full (rare), so concurrent senders (one
+    // worker thread per server connection) do not serialize.
     mutable std::mutex txMu_;
     std::deque<TxPacket> txQueue_;
     static constexpr size_t kMaxTxQueue = 256; // max queued packets
-    Stats stats_;
+
+    // Queue-depth counters: only touched on the WOULDBLOCK path, which is rare
+    // and already under txMu_, so they need no striping.
+    struct QueueCounters {
+        uint64_t count = 0;  // packets queued on WOULDBLOCK
+        uint64_t drop = 0;   // packets dropped (queue full)
+        size_t peak = 0;     // peak queue depth
+    } queueStats_;
+
+    // Per-packet counters, bumped without any lock from every connection's
+    // worker thread. Striped: see StripedCounter above.
+    StripedCounter txSendSuccess_;
+    StripedCounter txDrainSuccess_;
+    StripedCounter txDrainWouldBlock_;
+    StripedCounter txDrainError_;
+    StripedCounter rxPackets_;
 };
 
 } // namespace hy2::quic_backend
