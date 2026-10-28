@@ -21,6 +21,7 @@ public:
         stream_->CancelRead(StreamErrorCode(0));
         stream_->Close();
     }
+    void CloseWrite() override { stream_->CloseWrite(); }
 
     void CancelRead(StreamErrorCode code) override { stream_->CancelRead(code); }
     void CancelWrite(StreamErrorCode code) override { stream_->CancelWrite(code); }

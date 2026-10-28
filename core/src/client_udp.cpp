@@ -13,13 +13,23 @@ UdpConn::UdpConn(uint32_t id, std::shared_ptr<UdpIO> io)
       ReceiveCh(std::make_shared<Channel<std::shared_ptr<proto::UDPMessage>>>(
           kUdpMessageChanSize)) {}
 
-bool UdpConn::Receive(std::vector<uint8_t>& data, std::string& addr) {
+UdpRecvResult UdpConn::ReceivePacket(std::vector<uint8_t>& data, std::string& addr,
+                                     Duration timeout) {
+    // One deadline for the whole call, not one per loop iteration: a fragment
+    // arriving every 60 ms would otherwise keep pushing the deadline forward
+    // and the caller's timeout would never fire.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::nanoseconds(timeout.ns);
     for (;;) {
         std::shared_ptr<proto::UDPMessage> msg;
-        if (!ReceiveCh->ReceiveFor(msg, std::chrono::milliseconds(100))) {
-            // Timeout or closed �� return false so the caller can check its deadline
-            if (ReceiveCh->Closed()) return false;
-            return false;
+        const auto remaining = deadline - std::chrono::steady_clock::now();
+        if (remaining <= std::chrono::steady_clock::duration::zero()) {
+            return UdpRecvResult::kTimeout;
+        }
+        if (!ReceiveCh->ReceiveFor(msg, remaining)) {
+            // ReceiveFor only reports false on timeout or closed-and-drained.
+            return ReceiveCh->Closed() ? UdpRecvResult::kClosed
+                                       : UdpRecvResult::kTimeout;
         }
         auto dfMsg = D.Feed(std::move(msg));
         if (!dfMsg) {
@@ -30,8 +40,14 @@ bool UdpConn::Receive(std::vector<uint8_t>& data, std::string& addr) {
         // payload out instead of copying it into the caller's buffers (H4/M6).
         data = std::move(dfMsg->Data);
         addr = std::move(dfMsg->Addr);
-        return true;
+        return UdpRecvResult::kPacket;
     }
+}
+
+bool UdpConn::Receive(std::vector<uint8_t>& data, std::string& addr) {
+    return ReceivePacket(data, addr,
+                         Duration::FromMillis(kReceiveTimeout.count())) ==
+           UdpRecvResult::kPacket;
 }
 
 void UdpConn::Send(const uint8_t* data, size_t n, const std::string& addr) {
@@ -61,7 +77,15 @@ void UdpConn::Send(const uint8_t* data, size_t n, const std::string& addr) {
     }
 }
 
-void UdpConn::Close() { closed_.store(true); }
+void UdpConn::Close() {
+    closed_.store(true);
+    // Also close the channel, so a thread already parked in ReceivePacket()
+    // is woken and observes the close instead of waiting out its whole
+    // deadline. Setting the flag alone left it sleeping: Close() is called
+    // from the caller's teardown thread (and from closeCleanup on connection
+    // loss), which is exactly when a receiver must not linger.
+    ReceiveCh->Close();
+}
 
 // ---------------------------------------------------------------------------
 // ClientUdpSessionManager

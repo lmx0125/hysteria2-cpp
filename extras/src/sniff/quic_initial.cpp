@@ -537,7 +537,11 @@ bool IsQuicInitial(const uint8_t* data, size_t len) {
 
 #endif // HY2_OPENSSL_AVAILABLE
 
-#ifndef HY2_OPENSSL_AVAILABLE
+// HY2_OPENSSL_AVAILABLE is always DEFINED (as 0 or 1) by the block at the top
+// of this file, so `#ifndef` is never true - the fallback IsQuicInitial was
+// never compiled, and any target without an OpenSSL include path (hy2_extras
+// itself) failed to link. Test the value, not the presence.
+#if !HY2_OPENSSL_AVAILABLE
 // IsQuicInitial is a pure header parser, no OpenSSL needed
 bool IsQuicInitial(const uint8_t* data, size_t len) {
     if (len < 7) return false;

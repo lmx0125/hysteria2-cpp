@@ -25,6 +25,7 @@ endforeach()
 set(TEST_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_SOURCE_DIR}/app/include
+    ${CMAKE_SOURCE_DIR}/core/quic_backend/include
 )
 
 # ---------------------------------------------------------------------------
@@ -37,12 +38,25 @@ set(ALYSSUM_PROXY_FORWARD_DIR
 if(EXISTS "${ALYSSUM_PROXY_FORWARD_DIR}/proxy_engine.cpp")
     list(APPEND TEST_SOURCES
         "${ALYSSUM_PROXY_FORWARD_DIR}/proxy_engine.cpp"
-        "${ALYSSUM_PROXY_FORWARD_DIR}/packet_parser.cpp")
+        "${ALYSSUM_PROXY_FORWARD_DIR}/packet_parser.cpp"
+        "${ALYSSUM_PROXY_FORWARD_DIR}/../nodes/node_prober.cpp"
+        "${ALYSSUM_PROXY_FORWARD_DIR}/../nodes/client_pool.cpp")
+    list(APPEND TEST_INCLUDE_DIRS "${ALYSSUM_PROXY_FORWARD_DIR}/../nodes")
     list(APPEND TEST_INCLUDE_DIRS "${ALYSSUM_PROXY_FORWARD_DIR}")
+endif()
+
+# The lifecycle audit test drives the QUIC backend's UdpSocket directly, so the
+# unified runners need that library; without the backend the test cannot build.
+if(NOT HY2_WITH_QUIC_BACKEND)
+    list(REMOVE_ITEM TEST_SOURCES
+        "${CMAKE_CURRENT_SOURCE_DIR}/concurrency_lifecycle_audit_test.cpp")
 endif()
 
 # Common link libs for all test targets
 set(TEST_LINK_LIBS hy2_core hy2_extras hy2_app)
+if(HY2_WITH_QUIC_BACKEND)
+    list(APPEND TEST_LINK_LIBS hy2_quic_backend)
+endif()
 
 # ---------------------------------------------------------------------------
 # 1. hy2_tests - Original unit test executable (test_main.cpp)

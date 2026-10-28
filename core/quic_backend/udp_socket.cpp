@@ -1,5 +1,8 @@
 #include "hy2/quic_backend/udp_socket.hpp"
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 
@@ -17,6 +20,54 @@
 #endif
 
 namespace hy2::quic_backend {
+
+namespace {
+// Connect-path timing, printed only under HY2_QUIC_DEBUG. A handshake that
+// takes hundreds of milliseconds on LOOPBACK is slow for reasons that have
+// nothing to do with the network, and there is no other way to see which step
+// owns the time - the app's node prober reports the total and nothing else.
+bool SocketDiag() {
+    static const bool v = std::getenv("HY2_QUIC_DEBUG") != nullptr;
+    return v;
+}
+double MsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+}
+
+// SO_RCVBUF/SO_SNDBUF for every socket this file creates, in one place: Bind
+// (listeners) and Connect (clients) used to carry separate copies of the same
+// number, which is how they drift apart.
+//
+// The value is a *request per socket*, so it multiplies: pool_size 3 asked for
+// 192MB across its three data sockets, and every node probe asked for another
+// 64MB (probes dial a whole connection, see NodeProber).
+//
+// 32MB was picked for loopback, where the default 4MB overflowed while the
+// sender ramped up cwnd during slow start. Re-measured 2026-10-12 with
+// hy2_local_bench (10s download, one session, the three sizes alternated over
+// three rounds): 8MB 50.75, 16MB 50.97, 32MB 50.86 MB/s - the spread within one
+// size (44-54) is wider than the spread between them, so loopback cannot
+// resolve this knob any more. 16MB is the middle landing spot: it halves the
+// per-socket request (and with it the pool x sockets multiplier) while sitting
+// inside the band that measured clean, and it still covers a cwnd-sized burst
+// on a real line (~2x the ~4MB bandwidth-delay product of 190Mbps over 166ms).
+//
+// HY2_UDP_BUFSIZE_MB overrides it (A/B, and for loopback benches).
+int UdpSocketBufferBytes() {
+    static const int bytes = [] {
+        int mb = 16;
+        if (const char* env = std::getenv("HY2_UDP_BUFSIZE_MB")) {
+            const int v = std::atoi(env);
+            if (v > 0) mb = v;
+        }
+        if (mb < 1) mb = 1;
+        if (mb > 64) mb = 64;
+        return mb * 1024 * 1024;
+    }();
+    return bytes;
+}
+}  // namespace
 
 #ifdef _WIN32
 static bool InitWinsock() {
@@ -117,9 +168,8 @@ bool UdpSocket::Bind(const std::string& addr, uint16_t port) {
 
     // Generous receive buffer: the listener drains in a tight loop but
     // bursts from many clients can otherwise overflow and lose packets.
-    // 32MB: loopback needs headroom for sender bursts; the default 4MB
-    // overflowed when the sender ramped up cwnd during slow start.
-    int bufSize = 32 * 1024 * 1024;
+    // See UdpSocketBufferBytes() for the size and why it is not 32MB.
+    int bufSize = UdpSocketBufferBytes();
     setsockopt(fd_, SOL_SOCKET, SO_RCVBUF,
                reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
     setsockopt(fd_, SOL_SOCKET, SO_SNDBUF,
@@ -134,15 +184,19 @@ bool UdpSocket::Bind(const std::string& addr, uint16_t port) {
 
 bool UdpSocket::Connect(const std::string& addr, uint16_t port,
                         const std::string& localBindAddr) {
+    const auto tStart = std::chrono::steady_clock::now();
 #ifdef _WIN32
     if (!InitWinsock()) return false;
 #endif
+    const auto tWsa = std::chrono::steady_clock::now();
     struct sockaddr_storage remoteAddr;
     socklen_t remoteLen;
     if (!ResolveAddress(addr, port, &remoteAddr, &remoteLen)) return false;
+    const auto tResolve = std::chrono::steady_clock::now();
 
     fd_ = CreateNonBlockingSocket(remoteAddr.ss_family);
     if (fd_ < 0) return false;
+    const auto tSock = std::chrono::steady_clock::now();
 
     // Optional local pinning: keeps the socket on the interface that owns the
     // given address even if the routing table later points elsewhere.
@@ -160,16 +214,32 @@ bool UdpSocket::Connect(const std::string& addr, uint16_t port,
         }
     }
 
-    // Generous buffers for bulk transfers on high-BDP or loopback paths.
-    int bufSize = 32 * 1024 * 1024;
+    // Generous buffers for bulk transfers on high-BDP or loopback paths - size
+    // and rationale in UdpSocketBufferBytes().
+    int bufSize = UdpSocketBufferBytes();
     setsockopt(fd_, SOL_SOCKET, SO_RCVBUF,
                reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
     setsockopt(fd_, SOL_SOCKET, SO_SNDBUF,
                reinterpret_cast<const char*>(&bufSize), sizeof(bufSize));
+    const auto tBuf = std::chrono::steady_clock::now();
 
     if (::connect(fd_, reinterpret_cast<struct sockaddr*>(&remoteAddr), remoteLen) < 0) {
         Close();
         return false;
+    }
+    if (SocketDiag()) {
+        const auto tEnd = std::chrono::steady_clock::now();
+        std::fprintf(stderr,
+                     "[DIAG-SOCK] %s:%u wsa=%.1f resolve=%.1f socket=%.1f bufs=%.1f "
+                     "connect=%.1f total=%.1f ms\n",
+                     addr.c_str(), static_cast<unsigned>(port),
+                     std::chrono::duration<double, std::milli>(tWsa - tStart).count(),
+                     std::chrono::duration<double, std::milli>(tResolve - tWsa).count(),
+                     std::chrono::duration<double, std::milli>(tSock - tResolve).count(),
+                     std::chrono::duration<double, std::milli>(tBuf - tSock).count(),
+                     std::chrono::duration<double, std::milli>(tEnd - tBuf).count(),
+                     MsSince(tStart));
+        std::fflush(stderr);
     }
     return true;
 }
@@ -436,8 +506,7 @@ size_t UdpSocket::DrainTxQueue() {
 }
 
 bool UdpSocket::HasQueuedPackets() const {
-    std::lock_guard<std::mutex> lk(txMu_);
-    return !txQueue_.empty();
+    return txQueued_.load(std::memory_order_acquire);
 }
 
 UdpSocket::Stats UdpSocket::GetStats() const {

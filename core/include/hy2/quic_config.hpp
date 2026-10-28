@@ -30,6 +30,10 @@ struct QuicConfig {
     // Non-zero selects the fixed-rate, loss-insensitive "Brutal" congestion
     // controller (Hysteria's sender) instead of a loss-responsive one.
     uint64_t BrutalRate = 0;
+    // Mirrors BandwidthConfig::DisableLossCompensation for the transport
+    // backend: pins Brutal's loss-compensation factor to 1 instead of letting
+    // the measured ack rate inflate the window and the pacing rate.
+    bool BrutalDisableLossCompensation = false;
     bool DisablePathMTUDiscovery = false; // may be overridden on unsupported platforms
     bool DisableGSO = false;
     bool DisableChromeParrot = false; // client only; Chrome parroting on by default

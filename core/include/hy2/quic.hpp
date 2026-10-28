@@ -28,6 +28,7 @@ public:
     // Close closes only the write side in raw QUIC terms; use via QStream for
     // the combined semantics used throughout hysteria.
     using IHyStream::Close;
+    void CloseWrite() override { Close(); }
 };
 
 // QuicStatsSnapshot is a backend-neutral view of one connection's counters,

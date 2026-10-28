@@ -34,6 +34,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <deque>
+#include <unordered_map>
 
 namespace hy2::outbounds {
 
@@ -50,8 +51,22 @@ static bool g_wsaInit = true;
 
 constexpr int kDialTimeoutSec = 10;
 
+// Nagle would hold a small segment until the previous one is acknowledged - on
+// Windows that is the 200 ms delayed-ACK timer, and a proxied request/response
+// stream pays it on every round trip. The relay writes whole buffers, so there
+// is nothing here worth coalescing.
+void setTcpNoDelay(int fd) {
+    int on = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&on), sizeof(on));
+}
+
 // Test hook counter (see DirectOutboundUdpResolveCount in direct.hpp).
 std::atomic<uint64_t> g_udpResolveCalls{0};
+
+// Test hook counter for the TCP path (see DirectOutboundTcpResolveCount).
+std::atomic<uint64_t> g_tcpResolveCalls{0};
+
 
 // ---------------------------------------------------------------------------
 // TCP Fast Open (TFO) support
@@ -219,6 +234,66 @@ ResolvedAddr resolveHost(const std::string& host, uint16_t port) {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// TCP-side hostname cache.
+//
+// The UDP path got this cache (see ResolveTarget below) after a measurement
+// showed the resolver on the datagram path; the TCP path - which dials a fresh
+// destination for every proxied connection - did not, so a browser opening a
+// page against one hostname paid a blocking getaddrinfo() per connection, on
+// the relay worker thread. Only real hostnames are cached: a numeric literal
+// is already handled without the resolver by tryParseIP, which is the common
+// case, and caching it would evict the entry that actually matters.
+//
+// Deliberately bounded and tiny (no TTL): this is a connection-rate cache for
+// a proxy relaying one dial at a time, not a general resolver. 128 entries is
+// far below any real browsing working set, so an entry that keeps getting hit
+// survives, and DNS changes are picked up once the working set churns past it.
+constexpr size_t kTcpResolveCacheMax = 128;
+
+struct TcpResolveCache {
+    std::mutex mu;
+    std::unordered_map<std::string, ResolvedAddr> byHost;  // key: "host:port"
+    std::deque<std::string> order;                          // FIFO for eviction
+    std::atomic<uint64_t> hits{0};
+    std::atomic<uint64_t> misses{0};
+
+    // Returns true and fills out on a hit.
+    bool Lookup(const std::string& key, ResolvedAddr& out) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = byHost.find(key);
+        if (it == byHost.end()) {
+            misses.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        out = it->second;
+        hits.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    void Store(const std::string& key, const ResolvedAddr& value) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (byHost.find(key) != byHost.end()) return;
+        if (byHost.size() >= kTcpResolveCacheMax && !order.empty()) {
+            byHost.erase(order.front());
+            order.pop_front();
+        }
+        byHost.emplace(key, value);
+        order.push_back(key);
+    }
+
+    void Clear() {
+        std::lock_guard<std::mutex> lk(mu);
+        byHost.clear();
+        order.clear();
+    }
+};
+
+TcpResolveCache& TcpResolve() {
+    static TcpResolveCache cache;
+    return cache;
+}
+
 // tryParseIP - check if host is already an IP address
 bool tryParseIP(const std::string& host, ResolvedAddr& out) {
     // Try IPv4
@@ -327,6 +402,7 @@ int dialTCP(const std::string& ip, uint16_t port, int timeoutSec) {
             }
             // Restore blocking
             fcntl(fd, F_SETFL, flags);
+            setTcpNoDelay(fd);
             return fd;
         }
         // TFO failed, fall back to regular connect
@@ -360,6 +436,7 @@ int dialTCP(const std::string& ip, uint16_t port, int timeoutSec) {
     fcntl(fd, F_SETFL, flags);
 #endif
 
+    setTcpNoDelay(fd);
     return fd;
 }
 
@@ -506,8 +583,10 @@ private:
             std::string fromAddr = std::string(ip) + ":" + std::to_string(port);
             std::lock_guard<std::mutex> lk(mu_);
             if (closed_) break;
-            queue_.push_back({std::vector<uint8_t>(buf, buf + n), std::string(fromAddr)});
-            cv_.notify_all();
+            queue_.push_back({std::vector<uint8_t>(buf, buf + n), std::move(fromAddr)});
+            // Single consumer (ReadFrom): waking everyone just to have one of
+            // them re-park is pure context switching.
+            cv_.notify_one();
         }
     }
 
@@ -590,6 +669,15 @@ uint64_t DirectOutboundUdpResolveCount() {
     return g_udpResolveCalls.load(std::memory_order_relaxed);
 }
 
+uint64_t DirectOutboundTcpResolveCount() {
+    return g_tcpResolveCalls.load(std::memory_order_relaxed);
+}
+
+void DirectOutboundResetTcpResolveCache() {
+    TcpResolve().Clear();
+    g_tcpResolveCalls.store(0, std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------
 // DirectOutbound
 
@@ -606,10 +694,21 @@ std::shared_ptr<server::IConn> DirectOutbound::TCP(const std::string& reqAddr) {
     std::string host = reqAddr.substr(0, colon);
     uint16_t port = static_cast<uint16_t>(std::atoi(reqAddr.c_str() + colon + 1));
 
-    // Resolve
+    // Resolve. A numeric literal never touches the resolver; a hostname is
+    // cached, because every proxied connection dials a fresh destination and
+    // this call blocks the relay worker thread.
     ResolvedAddr resolved;
     if (!tryParseIP(host, resolved)) {
-        resolved = resolveHost(host, port);
+        const std::string key = host + ":" + std::to_string(port);
+        if (!TcpResolve().Lookup(key, resolved)) {
+            g_tcpResolveCalls.fetch_add(1, std::memory_order_relaxed);
+            resolved = resolveHost(host, port);
+            // Only cache a success: caching a failure would pin a transient
+            // resolver error for the whole working set.
+            if (!resolved.ipv4.empty() || !resolved.ipv6.empty()) {
+                TcpResolve().Store(key, resolved);
+            }
+        }
     }
 
     if (resolved.ipv4.empty() && resolved.ipv6.empty()) {

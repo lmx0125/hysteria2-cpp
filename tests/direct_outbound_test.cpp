@@ -382,3 +382,76 @@ HY_TEST(DirectOutbound_UdpTargetChangeFollowed) {
 
     conn->Close();
 }
+
+// ---------------------------------------------------------------------------
+// TCP-side hostname caching.
+//
+// Every proxied TCP connection dials a fresh destination, and "localhost" is a
+// real hostname (not a numeric literal), so it went through getaddrinfo() on
+// every single dial - blocking the relay worker thread. These pin the cache
+// that fixes it.
+// ---------------------------------------------------------------------------
+HY_TEST(DirectOutbound_TcpResolvesHostnameOnce) {
+    TcpEchoServer server;
+    HY_CHECK(server.ok());
+
+    DirectOutboundResetTcpResolveCache();
+    DirectOutbound ob(DirectOutboundMode::IPv4Only);
+    const std::string addr = "localhost:" + std::to_string(server.port());
+
+    // First dial resolves; the rest must be served from the cache.
+    for (int i = 0; i < 8; ++i) {
+        auto conn = ob.TCP(addr);
+        HY_CHECK(conn != nullptr);
+        conn->Close();
+    }
+
+    HY_CHECK_EQ(DirectOutboundTcpResolveCount(), (uint64_t)1);
+}
+
+// A numeric literal must never reach the resolver at all.
+HY_TEST(DirectOutbound_TcpNumericLiteralSkipsResolver) {
+    TcpEchoServer server;
+    HY_CHECK(server.ok());
+
+    DirectOutboundResetTcpResolveCache();
+    DirectOutbound ob(DirectOutboundMode::IPv4Only);
+
+    for (int i = 0; i < 4; ++i) {
+        auto conn = ob.TCP("127.0.0.1:" + std::to_string(server.port()));
+        HY_CHECK(conn != nullptr);
+        conn->Close();
+    }
+    HY_CHECK_EQ(DirectOutboundTcpResolveCount(), (uint64_t)0);
+}
+
+// The cache must key on host:port, so a different port is a different target
+// and must not be served a stale entry.
+HY_TEST(DirectOutbound_TcpCacheKeyedByPort) {
+    TcpEchoServer serverA;
+    TcpEchoServer serverB;
+    HY_CHECK(serverA.ok());
+    HY_CHECK(serverB.ok());
+    HY_CHECK(serverA.port() != serverB.port());
+
+    DirectOutboundResetTcpResolveCache();
+    DirectOutbound ob(DirectOutboundMode::IPv4Only);
+
+    auto a = ob.TCP("localhost:" + std::to_string(serverA.port()));
+    auto b = ob.TCP("localhost:" + std::to_string(serverB.port()));
+    HY_CHECK(a != nullptr);
+    HY_CHECK(b != nullptr);
+
+    // Each distinct host:port resolves once - the second is not a cache hit.
+    HY_CHECK_EQ(DirectOutboundTcpResolveCount(), (uint64_t)2);
+
+    // Both still work, i.e. the cache did not cross-wire the two servers.
+    for (auto& c : {a, b}) {
+        const char* msg = "ping";
+        c->Write(reinterpret_cast<const uint8_t*>(msg), std::strlen(msg));
+        uint8_t buf[64] = {};
+        size_t n = c->Read(buf, sizeof(buf));
+        HY_CHECK_EQ(std::string(reinterpret_cast<char*>(buf), n), std::string("ping"));
+        c->Close();
+    }
+}

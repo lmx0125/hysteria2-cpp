@@ -52,6 +52,10 @@ public:
     // in-stack Brutal controller with it.
     ByteCount BrutalRate() const override { return bps_; }
 
+    bool BrutalDisableLossCompensation() const override {
+        return disableLossCompensation_;
+    }
+
 private:
     struct PktInfo {
         int64_t Timestamp = 0;

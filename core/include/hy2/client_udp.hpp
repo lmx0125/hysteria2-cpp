@@ -38,10 +38,19 @@ public:
     UdpConn(uint32_t id, std::shared_ptr<UdpIO> io);
 
     bool Receive(std::vector<uint8_t>& data, std::string& addr) override;
+    UdpRecvResult ReceivePacket(std::vector<uint8_t>& data, std::string& addr,
+                                Duration timeout) override;
+    Duration ReceivePollTimeout() const override {
+        return Duration::FromMillis(kReceiveTimeout.count());
+    }
     void Send(const uint8_t* data, size_t n, const std::string& addr) override;
     void Close() override;
 
     bool IsClosed() const { return closed_.load(); }
+
+    // How long Receive() waits before reporting nothing. Exposed for tests:
+    // the relay loops under test must not have to run for a real second.
+    static constexpr auto kReceiveTimeout = std::chrono::milliseconds(100);
 
 private:
     friend class ClientUdpSessionManager;

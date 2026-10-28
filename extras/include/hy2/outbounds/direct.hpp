@@ -39,4 +39,11 @@ private:
 // per-datagram resolution.
 uint64_t DirectOutboundUdpResolveCount();
 
+// Test hooks for the TCP dial path. ResolveCount counts getaddrinfo() calls
+// made for a hostname (numeric literals never reach the resolver), so a second
+// dial to the same host must not grow it. ResetTcpResolveCache clears the
+// cache and both counters so a test starts from a known state.
+uint64_t DirectOutboundTcpResolveCount();
+void DirectOutboundResetTcpResolveCache();
+
 } // namespace hy2::outbounds

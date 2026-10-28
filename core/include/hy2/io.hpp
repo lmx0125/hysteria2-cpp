@@ -3,6 +3,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <cstddef>
@@ -43,6 +44,15 @@ class IByteReaderWriter : public IByteReader, public IByteWriter {
 public:
     // Close unblocks pending readers/writers where supported (default no-op).
     virtual void Close() {}
+    // Finish sending while continuing to receive. Never fall back to Close:
+    // that would discard a response which arrives after an upload's EOF.
+    virtual void CloseWrite() { throw Error("half-close is not supported"); }
+    // Deadline support, mirroring IHyStream below (zero time = no deadline;
+    // implementations may ignore). Declared here as well so a caller holding
+    // only an IByteReaderWriter - which is what Client::TCP() hands back - can
+    // bound a read instead of parking on it forever. Used by the node prober's
+    // data probe, which must fail in seconds rather than block a worker.
+    virtual void SetReadDeadline(MonoTime t) { (void)t; }
 };
 
 // ReadFull reads exactly len(buf) bytes or throws (short read => EOF as Error).
@@ -183,15 +193,16 @@ public:
     }
 
     void Close() {
-        std::lock_guard<std::mutex> lk(mu_);
-        closed_ = true;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            closed_.store(true, std::memory_order_release);
+        }
         cv_.notify_all();
         sendCv_.notify_all();
     }
 
     bool Closed() const {
-        std::lock_guard<std::mutex> lk(mu_);
-        return closed_;
+        return closed_.load(std::memory_order_relaxed);
     }
 
 private:
@@ -200,7 +211,7 @@ private:
     std::condition_variable sendCv_;
     std::deque<T> q_;
     size_t cap_;
-    bool closed_ = false;
+    std::atomic<bool> closed_{false};
 };
 
 } // namespace hy2

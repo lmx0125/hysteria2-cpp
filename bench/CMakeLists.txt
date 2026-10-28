@@ -70,3 +70,8 @@ set_target_properties(hy2_bench PROPERTIES
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
     message(STATUS "NOTE: For best benchmark accuracy, build with -DCMAKE_BUILD_TYPE=Release")
 endif()
+
+# Standalone sustained-stream A/B; no QUIC/network dependency.
+add_executable(hy2_receive_buffer_bench receive_buffer_bench.cc)
+target_include_directories(hy2_receive_buffer_bench PRIVATE ../core/include)
+target_compile_features(hy2_receive_buffer_bench PRIVATE cxx_std_20)

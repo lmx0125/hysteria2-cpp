@@ -77,6 +77,18 @@ public:
         peer->cv_.notify_one();
     }
 
+    void CloseWrite() override {
+        if (writeClosed_.exchange(true)) return;
+        if (auto peer = wpeer_.lock()) {
+            std::lock_guard<std::mutex> lk(peer->mu_);
+            if (!peer->peerClosedWrite_) {
+                peer->peerClosedWrite_ = true;
+                peer->chunks_.emplace_back();
+                peer->cv_.notify_all();
+            }
+        }
+    }
+
     void Close() override {
         {
             std::lock_guard<std::mutex> lk(mu_);
@@ -123,7 +135,7 @@ private:
     std::deque<std::vector<uint8_t>> chunks_;
     bool closed_ = false;
     bool closedReadSide_ = false;
-    bool writeClosed_ = false;
+    std::atomic<bool> writeClosed_{false};
     bool peerClosedWrite_ = false;
 };
 

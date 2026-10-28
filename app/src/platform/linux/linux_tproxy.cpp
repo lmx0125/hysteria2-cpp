@@ -388,7 +388,13 @@ void LinuxUdpTProxy::handleSession(int listenFd,
         std::vector<uint8_t> data;
         std::string addr;
         while (!done) {
-            if (!hyConn->Receive(data, addr)) break;
+            // A false return means "nothing yet" as well as "closed"; only
+            // the latter may end the relay. Poll the packet into `data` and
+            // keep the session alive across quiet periods.
+            if (!hyConn->Receive(data, addr)) {
+                if (hyConn->IsClosed()) break;
+                continue;
+            }
             send(connFd, data.data(), data.size(), 0);
         }
         bool expected = false;

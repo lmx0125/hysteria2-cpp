@@ -83,6 +83,7 @@ void Config::Fill() {
     if (BandwidthCfg.MaxTx > 0) {
         QUICConfig.CongestionControl = "brutal";
         QUICConfig.BrutalRate = BandwidthCfg.MaxTx;
+        QUICConfig.BrutalDisableLossCompensation = BandwidthCfg.DisableLossCompensation;
     }
     if (UDPIdleTimeout.ns == 0) {
         UDPIdleTimeout = kDefaultUDPIdleTimeout;

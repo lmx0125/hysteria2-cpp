@@ -152,8 +152,14 @@ DnsResult StandardDnsResolver::Resolve(const std::string& hostname) {
         return result;
     }
 
-    int fd = static_cast<int>(socket(res->ai_family, res->ai_socktype, res->ai_protocol));
-    if (fd < 0) {
+    // SOCKET is pointer-sized on Windows; narrowing it to int can truncate it.
+    const auto fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+#ifdef _WIN32
+    const bool invalidSocket = fd == INVALID_SOCKET;
+#else
+    const bool invalidSocket = fd < 0;
+#endif
+    if (invalidSocket) {
         freeaddrinfo(res);
         result.error = "failed to create socket";
         return result;
@@ -183,6 +189,28 @@ DnsResult StandardDnsResolver::Resolve(const std::string& hostname) {
     // Send query
     ::send(fd, reinterpret_cast<const char*>(wireQuery.data()),
            static_cast<int>(wireQuery.size()), 0);
+
+    // An unreachable/silent DNS server must not park this caller forever.
+    // select bounds the response wait on both UDP and TCP without depending
+    // on platform-specific SO_RCVTIMEO units.
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(fd, &readable);
+    timeval responseTimeout{3, 0};
+#ifdef _WIN32
+    const int ready = ::select(0, &readable, nullptr, nullptr, &responseTimeout);
+#else
+    const int ready = ::select(fd + 1, &readable, nullptr, nullptr, &responseTimeout);
+#endif
+    if (ready <= 0) {
+#ifdef _WIN32
+        closesocket(fd);
+#else
+        ::close(fd);
+#endif
+        result.error = ready == 0 ? "DNS response timeout" : "DNS response wait failed";
+        return result;
+    }
 
     // Read response
     std::vector<uint8_t> response(4096);

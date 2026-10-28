@@ -70,11 +70,35 @@ void SetGlobalClientTransport(ClientTransport* transport);
 // ---------------------------------------------------------------------------
 // HyUDPConn - client-side UDP relay connection.
 
+// Outcome of a timed UDP receive. A UDP relay session is idle most of the
+// time (a DNS lookup, a QUIC handshake, a game's keepalive), so "nothing
+// arrived yet" has to be distinguishable from "the session is over" -
+// treating the former as the latter tears down a perfectly good relay after
+// one quiet poll.
+enum class UdpRecvResult {
+    kPacket,  // data/addr were filled in
+    kTimeout, // nothing arrived within the deadline; the conn is still good
+    kClosed,  // the session ended (or the transport is gone)
+};
+
 class HyUDPConn {
 public:
     virtual ~HyUDPConn() = default;
-    // Receive blocks until a packet arrives. Returns false when closed (EOF).
+    // Receive blocks until a packet arrives. Returns false when closed (EOF)
+    // OR when the internal wait elapsed with nothing to deliver - callers that
+    // loop on it MUST tolerate spurious false returns (see ReceivePacket).
     virtual bool Receive(std::vector<uint8_t>& data, std::string& addr) = 0;
+    // ReceivePacket waits up to `timeout` for a datagram and reports which of
+    // the three outcomes happened, so a quiet session is distinguishable from
+    // a closed one. Defaulted in terms of Receive() with the requested
+    // timeout, which keeps every existing implementation correct; an
+    // implementation with a real condition variable (UdpConn) overrides it so
+    // the wait is exact instead of quantised to its internal polling period.
+    virtual UdpRecvResult ReceivePacket(std::vector<uint8_t>& data, std::string& addr,
+                                        Duration timeout);
+    // Test/diagnostic hook: the timeout the client-side implementation uses
+    // when Receive() is called. 0 = the built-in default.
+    virtual Duration ReceivePollTimeout() const { return Duration(0); }
     // Send sends a UDP packet to addr. Throws on error / fragments when needed.
     virtual void Send(const uint8_t* data, size_t n, const std::string& addr) = 0;
     virtual void Close() = 0;
@@ -97,6 +121,9 @@ public:
     // has no such notion (or a test double) reports zeros and the caller falls
     // back to its other inputs.
     virtual QuicStatsSnapshot Stats() const { return {}; }
+
+    // Returns true if the underlying transport is currently open and usable.
+    virtual bool IsOpen() const { return true; }
 };
 
 struct HandshakeInfo {

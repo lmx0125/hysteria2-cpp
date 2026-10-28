@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -10,6 +11,7 @@
 #include <ngtcp2/ngtcp2.h>
 
 #include "hy2/quic.hpp"
+#include "hy2/detail/receive_buffer.hpp"
 
 namespace hy2::quic_backend {
 
@@ -98,12 +100,11 @@ private:
     int64_t streamId_ = 0;
 
     mutable std::mutex readMu_;
-    std::vector<uint8_t> readBuf_;
-    size_t readPos_ = 0;
+    hy2::detail::ReceiveBuffer readBuf_;
     bool readEof_ = false;
     bool readClosed_ = false;
-    // Set by OnStreamData, cleared by FlushReadNotify (guarded by readMu_).
-    bool readDirty_ = false;
+    // Set by OnStreamData, cleared by FlushReadNotify (lock-free via atomic exchange).
+    std::atomic<bool> readDirty_{false};
     // Bytes consumed by the application but not yet returned to the peer as
     // flow-control credit (guarded by readMu_). Credit is returned in batches
     // to keep the per-read connection-lock traffic low; the receive window
@@ -127,8 +128,15 @@ private:
     std::deque<WriteChunk> writeChunks_;
     size_t cursor_ = 0;         // index of the chunk that holds sentOffset_
     uint64_t ackedOffset_ = 0;  // largest gap-free offset acked by the peer
-    uint64_t sentOffset_ = 0;   // next byte to hand to ngtcp2
-    uint64_t tailOffset_ = 0;   // end of all appended data
+    // sentOffset_/tailOffset_/finPending_ are the entire predicate of
+    // HasPendingWrite(), which the connection calls once per stream on every IO
+    // iteration (PickWritableStreamLocked -> the next stream with data). They
+    // stay guarded by writeMu_ like the rest of the write state, but being
+    // atomic lets that scan read the live values without taking one mutex per
+    // stream. Relaxed is enough: a stale read only makes the scan look again on
+    // the next Drive(), and every append is followed by a WakeUpOnData().
+    std::atomic<uint64_t> sentOffset_{0};  // next byte to hand to ngtcp2
+    std::atomic<uint64_t> tailOffset_{0};  // end of all appended data
     void AppendWriteLocked(const uint8_t* p, size_t n);
     void DropAckedLocked();
 
@@ -136,10 +144,23 @@ private:
     // pile up hundreds of MB while the peer's cwnd recovers (or a lossy path
     // keeps data in flight). Write() blocks above this; the ack callback
     // wakes it once the level drops back below the cap.
-    static constexpr size_t kMaxWriteBuf = 8 * 1024 * 1024;
+    //
+    // It is a per-stream ceiling, so it multiplies by the number of uploads in
+    // flight - 4MiB against a ~107-flow engine is 400MB of worst case, which is
+    // why this is the number to reach for first if upload memory ever shows up.
+    // 4MiB is still 2x the bandwidth-delay product the value was sized for
+    // (100Mbps x 166ms ~ 2MB), and the uplink on an asymmetric line is a
+    // fraction of that.
+    static constexpr size_t kMaxWriteBuf = 4 * 1024 * 1024;
 
     bool writeClosed_ = false;
-    bool finPending_ = false;    // FIN queued but not yet written into a packet
+    std::atomic<bool> finPending_{false};  // FIN queued but not yet in a packet
+
+    // Backpressure evidence for the TX-limit diagnostics (HY2_TXLIMIT_DIAG):
+    // how often Write() parked on kMaxWriteBuf and for how long. Read and
+    // summed by Ngtcp2Connection::PrintTxLimitLine.
+    std::atomic<uint64_t> writeBlockedCount_{0};
+    std::atomic<uint64_t> writeBlockedNs_{0};
 
     bool closed_ = false;
 

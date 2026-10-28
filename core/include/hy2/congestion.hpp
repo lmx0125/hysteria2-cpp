@@ -1,5 +1,19 @@
 // congestion.hpp - Congestion control interfaces mirroring quic-go's
 // congestion package surface used by the original Go code (brutal/bbr/pacer).
+//
+// NOT ON THE PRODUCTION SEND PATH. Everything in this file, and the
+// BbrSender / BrutalSender / Pacer / BandwidthSampler implementations behind
+// it, is a reference port kept for tests and bench. The congestion control that
+// actually governs the wire lives inside ngtcp2 (NGTCP2_CC_ALGO_BBR /
+// NGTCP2_CC_ALGO_BRUTAL, injected by third_party/CMakeLists.txt); the only
+// member of this surface that reaches it is BrutalRate(), read once per
+// connection to arm the ngtcp2 sender / set the brutal rate.
+//
+// Consequence: OnCongestionEventEx() has no production caller, so the BBR state
+// machine never runs - its window would stay at the initial value and its
+// pacing rate at zero. Do not wire CanSend / HasPacingBudget /
+// GetCongestionWindow into a send loop without first feeding
+// OnCongestionEventEx real per-packet ack/loss lists.
 #pragma once
 
 #include <memory>
@@ -47,6 +61,11 @@ public:
     // or 0 when it does not run at a fixed rate. The ngtcp2 backend reads it
     // to arm the equivalent in-stack controller (ngtcp2_conn_set_brutal_rate).
     virtual ByteCount BrutalRate() const { return 0; }
+
+    // Whether the fixed-rate sender was told to skip loss compensation (the
+    // ack-rate inflation of window and pacing rate). Only meaningful together
+    // with a non-zero BrutalRate().
+    virtual bool BrutalDisableLossCompensation() const { return false; }
 
     virtual void OnPacketSent(MonoTime sentTime, ByteCount bytesInFlight,
                               PacketNumber packetNumber, ByteCount bytes,

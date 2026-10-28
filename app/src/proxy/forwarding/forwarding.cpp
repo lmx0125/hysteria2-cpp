@@ -7,6 +7,8 @@
 #include <cstring>
 #include <thread>
 
+#include "hy2/client_udp.hpp"  // UdpConn::kReceiveTimeout
+
 namespace hy2::proxy::forwarding {
 
 namespace {
@@ -91,8 +93,12 @@ void UdpSessionEntry::ReceiveLoop(std::shared_ptr<server::IUdpConn> localConn,
         while (true) {
             std::vector<uint8_t> data;
             std::string from;
-            bool ok = HyConn->Receive(data, from);
-            if (!ok) break;
+            // Same distinction as the SOCKS5 relay: a quiet poll must not end
+            // the session, only a closed one may.
+            const auto r = HyConn->ReceivePacket(data, from,
+                                                 HyConn->ReceivePollTimeout());
+            if (r == client::UdpRecvResult::kClosed) break;
+            if (r == client::UdpRecvResult::kTimeout) continue;
 
             LastActiveNs.store(nowNs(), std::memory_order_release);
 

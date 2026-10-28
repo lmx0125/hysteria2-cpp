@@ -228,6 +228,14 @@ struct CountingClientIO : public hy2::client::UdpIO {
         if (n >= 0) conn.SendDatagram(buf, static_cast<size_t>(n));
     }
 };
+
+// NewUDP() returns the base HyUDPConn interface, so tests cannot read the
+// session id off the handle. A message is routed by SessionID, and the
+// manager hands ids out from 1 in order - the most recently created session
+// is the one under test, and its id is the current count.
+uint32_t SessionIdOf(const std::shared_ptr<ClientUdpSessionManager>& mgr) {
+    return static_cast<uint32_t>(mgr->Count());
+}
 } // namespace
 
 HY_TEST(ClientUdpSessionIdsAndRouting)
@@ -358,6 +366,100 @@ HY_TEST(ClientUdpSendReusesThreadLocalBuffer)
         }
         HY_CHECK(m.Data == expected);
     }
+}
+
+// A quiet UDP session must survive its poll timeout. Receive() reports false
+// both for "nothing arrived yet" and for "the session is over", and the relay
+// loops used to treat those as the same thing - so a DNS lookup, a QUIC
+// handshake or a game keepalive (>100 ms between replies) had its relay torn
+// down after the first idle poll. ReceivePacket() is what tells them apart.
+HY_TEST(ClientUdpReceivePacketSeparatesTimeoutFromClose)
+{
+    MockQuicConnection conn;
+    CountingClientIO io(conn);
+    auto ioPtr = std::shared_ptr<CountingClientIO>(&io, [](CountingClientIO*) {});
+    auto mgr = ClientUdpSessionManager::Create(ioPtr);
+    auto c = mgr->NewUDP();
+
+    // Idle session: the deadline elapses with nothing to deliver, and the
+    // connection is still perfectly usable.
+    std::vector<uint8_t> data;
+    std::string addr;
+    auto t0 = std::chrono::steady_clock::now();
+    auto r = c->ReceivePacket(data, addr, Duration::FromMillis(80));
+    auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - t0).count();
+    HY_CHECK(r == hy2::client::UdpRecvResult::kTimeout);
+    // The wait is the requested one, not the 100 ms internal poll - a caller
+    // asking for 80 ms must not be held for longer.
+    HY_CHECK(elapsedMs >= 70);
+    HY_CHECK(elapsedMs < 200);
+
+    // Still usable after the timeout: a datagram that arrives later is
+    // delivered normally.
+    // NewUDP() hands back the base interface; the session id the manager
+    // filed it under is what a datagram must carry to be routed to it.
+    UDPMessage msg;
+    msg.SessionID = SessionIdOf(mgr);
+    msg.FragCount = 1;
+    msg.Addr = "1.1.1.1:53";
+    msg.Data = {'h', 'i'};
+    uint8_t buf[512];
+    int n = msg.Serialize(buf, sizeof(buf));
+    conn.InjectDatagram(std::vector<uint8_t>(buf, buf + n));
+
+    r = c->ReceivePacket(data, addr, Duration::FromSeconds(2));
+    HY_CHECK(r == hy2::client::UdpRecvResult::kPacket);
+    HY_CHECK(data == std::vector<uint8_t>({'h', 'i'}));
+    HY_CHECK_EQ(addr, std::string("1.1.1.1:53"));
+
+    // Only an actual close reports kClosed.
+    c->Close();
+    r = c->ReceivePacket(data, addr, Duration::FromMillis(80));
+    HY_CHECK(r == hy2::client::UdpRecvResult::kClosed);
+}
+
+// The relay loop's own contract: a session that goes quiet for several polls
+// keeps running, and only a close ends it. This is the regression the bug
+// produced (relay dropped after ~100 ms of silence).
+HY_TEST(ClientUdpQuietSessionStaysUsableAcrossPolls)
+{
+    MockQuicConnection conn;
+    CountingClientIO io(conn);
+    auto ioPtr = std::shared_ptr<CountingClientIO>(&io, [](CountingClientIO*) {});
+    auto mgr = ClientUdpSessionManager::Create(ioPtr);
+    auto c = mgr->NewUDP();
+
+    // Stand in for the SOCKS5/forwarding receive loops: exactly the branch
+    // structure they use.
+    auto relayIteration = [&](std::chrono::milliseconds wait) {
+        std::vector<uint8_t> data;
+        std::string from;
+        auto res = c->ReceivePacket(data, from, Duration::FromMillis(wait.count()));
+        if (res == hy2::client::UdpRecvResult::kClosed) return 0;   // break
+        if (res == hy2::client::UdpRecvResult::kTimeout) return 1;  // continue
+        return 2;                                                   // deliver
+    };
+
+    // Four consecutive idle polls - the old code returned false on the first
+    // one and every caller broke out of its loop.
+    for (int i = 0; i < 4; ++i) {
+        HY_CHECK_EQ(relayIteration(std::chrono::milliseconds(50)), 1);
+    }
+
+    // The session is still alive and delivers when data finally arrives.
+    UDPMessage msg;
+    msg.SessionID = SessionIdOf(mgr);
+    msg.FragCount = 1;
+    msg.Addr = "8.8.8.8:53";
+    msg.Data = {'o', 'k'};
+    uint8_t buf[512];
+    int n = msg.Serialize(buf, sizeof(buf));
+    conn.InjectDatagram(std::vector<uint8_t>(buf, buf + n));
+    HY_CHECK_EQ(relayIteration(std::chrono::milliseconds(1000)), 2);
+
+    c->Close();
+    HY_CHECK_EQ(relayIteration(std::chrono::milliseconds(50)), 0);
 }
 
 // ---------------------------------------------------------------------------

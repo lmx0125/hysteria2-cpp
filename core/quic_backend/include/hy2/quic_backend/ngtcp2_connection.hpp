@@ -127,6 +127,25 @@ public:
     // MAX_STREAM_DATA/MAX_DATA update is emitted promptly.
     void ExtendReadCredit(int64_t stream_id, uint64_t credit);
 
+    // Abruptly shuts down a stream: emits STOP_SENDING + RESET_STREAM so the
+    // peer stops transmitting on it immediately. Without this, a stream the
+    // application abandons mid-transfer (the video player seeking) kept the
+    // peer sending at full rate until its own send window drained - the dead
+    // stream consumed this connection's flow-control window and the new
+    // streams starved. Safe to call on an already-closed/unknown stream
+    // (ngtcp2 returns 0 for those). Caller must NOT hold readMu_/writeMu_
+    // (same lock order as ExtendReadCredit).
+    void ShutdownStream(int64_t stream_id, uint64_t app_error_code);
+
+    // ShutdownStream plus a connection-level window credit for bytes the
+    // stream had already DELIVERED to the application but that nobody read
+    // (the app-level readBuf_ tail + an unflushed credit batch). Called from
+    // CancelRead on the abort path; must run under the same op lock as the
+    // shutdown so the credit and the STOP_SENDING cannot interleave with a
+    // connection-window exhaustion.
+    void ShutdownStreamEx(int64_t stream_id, uint64_t app_error_code,
+                          uint64_t connCredit);
+
     // Congestion control integration
     void SetCongestionControl(std::shared_ptr<cc::CongestionControl> cc) override;
 
@@ -401,6 +420,8 @@ private:
     int64_t lastPickedStream_ = -1;
     // Cumulative ngtcp2_conn_read_pkt duration (HY2_BW_DIAG instrumentation).
     long long readPktNsAcc_ = 0;
+    // Cumulative socket_->Recv() duration in the drain loop (same gate).
+    long long recvNsAcc_ = 0;
     // Cumulative SendPacket duration (HY2_BW_DIAG instrumentation).
     long long sendNsAcc_ = 0;
     // Same, reported by the once-per-second DRIVE-BREAKDOWN line (kept apart
@@ -527,6 +548,12 @@ private:
     std::atomic<bool> serverLoopRunning_{false};
     static constexpr size_t kMaxRxQueue = 8192;
     static constexpr size_t kMaxRxPool = 8192;
+    // How many datagrams one InternalLoop drain turn may feed to ngtcp2 before
+    // it has to go back and let Drive() send the ACKs they earned. See the
+    // comment at the drain loop. Bounded well under the queue limits above:
+    // at 1452 bytes a packet this is ~370 KB, i.e. more than a typical
+    // connection window is willing to have in flight unacknowledged anyway.
+    static constexpr int kMaxRxDrainPackets = 256;
 
     // Cached ngtcp2 path (local/remote addresses never change after init).
     ngtcp2_path_storage cachedPath_{};
@@ -603,6 +630,36 @@ private:
         void Reset();
     };
     Diag diag_;
+
+    // ---- TX-limit diagnostics (enabled by HY2_TXLIMIT_DIAG=1) --------------
+    // Every mechanism that can stop the send burst gets its own counter, so one
+    // line says which one is in charge of the rate:
+    //   noStream      - nothing to send (the limit is upstream: the peer, or
+    //                   the application not producing fast enough)
+    //   blocked       - writev_stream returned 0: the transport refused
+    //     cwndZero    - ... and the congestion window was exhausted
+    //     flowControl - ... but the window had room: the peer's flow-control
+    //                   limit (MAX_STREAM_DATA / MAX_DATA) or the pacer
+    //   burst         - the pacing burst budget was spent (pacer in charge)
+    //   error/sendFail- encoding failed, or the socket refused the datagram
+    //   appWrite*     - the application writer parked on kMaxWriteBuf
+    //                   (unacknowledged bytes), i.e. backpressure from the peer
+    struct TxLimit {
+        std::atomic<uint64_t> noStream{0};
+        std::atomic<uint64_t> blocked{0};
+        std::atomic<uint64_t> cwndZero{0};
+        std::atomic<uint64_t> flowControl{0};
+        std::atomic<uint64_t> burst{0};
+        std::atomic<uint64_t> error{0};
+        std::atomic<uint64_t> sendFail{0};
+        std::atomic<uint64_t> lastCwnd{0};
+        std::atomic<uint64_t> lastInflight{0};
+        std::atomic<uint64_t> lastSrttNs{0};
+        std::atomic<uint64_t> lastQuantum{0};
+        std::atomic<uint64_t> lastPaceIntervalM{0};
+    };
+    TxLimit txLim_;
+    void PrintTxLimitLine(const char* side);
 
 public:
     // Runtime diagnostic counters. Exposed so tests can assert that the

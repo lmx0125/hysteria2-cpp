@@ -429,6 +429,27 @@ client::ClientTransport::AuthResult H3AuthRoundTripper::RoundTrip(
         throw ConnectError("failed to establish QUIC connection");
     }
 
+    // A handshake that fails must not leave this connection behind: its
+    // internal loop thread holds a strong self-reference, so dropping our
+    // shared_ptr is not enough to destroy it - the connection (UDP socket and
+    // thread included) stays alive until the QUIC idle timeout. Measured
+    // 2026-10-11: a node prober walking four unreachable nodes had 30 live
+    // connections after 25 s, one socket per ~1.2 s, and every failed pool
+    // handshake did the same. CloseWithError() sets the flag the loop polls,
+    // so the loop exits and the connection is really torn down.
+    struct AbandonGuard {
+        IQuicConnection* conn;
+        bool handedOver = false;
+        ~AbandonGuard() {
+            if (!handedOver && conn) {
+                try {
+                    conn->CloseWithError(client::CloseErrCodeOK, "");
+                } catch (...) {
+                }
+            }
+        }
+    } abandon{conn.get()};
+
     // Build auth headers matching Go client format
     // Go sends: Hysteria-Auth, Hysteria-CC-RX, Hysteria-Padding
     proto::HeaderMap hm;
@@ -452,6 +473,8 @@ client::ClientTransport::AuthResult H3AuthRoundTripper::RoundTrip(
     for (auto& h : resp.Headers) {
         result.Headers[h.first] = h.second;
     }
+    // Success: the connection now belongs to the caller (ClientImpl::connect).
+    abandon.handedOver = true;
     result.Conn = std::move(conn);
 
     return result;

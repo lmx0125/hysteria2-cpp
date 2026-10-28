@@ -106,6 +106,12 @@ public:
     virtual bool Send(const uint8_t* data, size_t len, const std::string& addr) = 0;
     virtual bool Receive(std::vector<uint8_t>& data, std::string& addr) = 0;
     virtual void Close() = 0;
+
+    // True once the session is over. An implementation whose Receive()
+    // reports "nothing yet" the same way it reports EOF must override this,
+    // otherwise the relay loops cannot tell a quiet UDP flow from a finished
+    // one and will drop the former (see the identical fix in HyUDPConn).
+    virtual bool IsClosed() const { return false; }
 };
 using UdpDialFunc = std::function<std::shared_ptr<IHyUDPConn>()>;
 

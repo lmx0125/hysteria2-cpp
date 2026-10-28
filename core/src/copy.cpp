@@ -24,6 +24,17 @@ bool CopyDiagOn() {
     return on;
 }
 
+// Per-call transfer trace (HY2_COPY_TRACE=1): four lines per Read/Write, at
+// line rate. It has its own switch because it is far too heavy to ride along
+// with HY2_DIAG - GB-scale output, and the synchronous fflush on every line
+// costs real throughput, which is how a "--debug" run got mistaken for a slow
+// build. Same split as HY2_DRIVE_TRACE in the QUIC backend; HY2_DIAG keeps
+// the one-line-per-second summary above.
+bool CopyTraceOn() {
+    static const bool on = std::getenv("HY2_COPY_TRACE") != nullptr;
+    return on;
+}
+
 struct CopyDiag {
     uint64_t bytes = 0;
     uint64_t calls = 0;
@@ -288,13 +299,13 @@ std::string CopyTwoWay(std::shared_ptr<IByteReaderWriter> serverRw,
         auto* raw = TLSGet();
         auto& buf = *static_cast<std::array<uint8_t, kCopyBufSize>*>(raw);
         for (;;) {
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read...\n", tagA); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s read...\n", tagA); std::fflush(stderr); }
             size_t n = remoteRw->Read(buf.data(), buf.size());
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read=%zu\n", tagA, n); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s read=%zu\n", tagA, n); std::fflush(stderr); }
             if (n == 0) break;
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s write %zu...\n", tagA, n); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s write %zu...\n", tagA, n); std::fflush(stderr); }
             serverRw->Write(buf.data(), n);
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s wrote %zu\n", tagA, n); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s wrote %zu\n", tagA, n); std::fflush(stderr); }
             diagA.Add(tagA, n);
         }
         TLSPut(raw);
@@ -303,13 +314,13 @@ std::string CopyTwoWay(std::shared_ptr<IByteReaderWriter> serverRw,
         auto* raw = TLSGet();
         auto& buf = *static_cast<std::array<uint8_t, kCopyBufSize>*>(raw);
         for (;;) {
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read...\n", tagB); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s read...\n", tagB); std::fflush(stderr); }
             size_t n = serverRw->Read(buf.data(), buf.size());
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s read=%zu\n", tagB, n); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s read=%zu\n", tagB, n); std::fflush(stderr); }
             if (n == 0) break;
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s write %zu...\n", tagB, n); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s write %zu...\n", tagB, n); std::fflush(stderr); }
             remoteRw->Write(buf.data(), n);
-            if (CopyDiagOn()) { std::fprintf(stderr, "[copy] %s wrote %zu\n", tagB, n); std::fflush(stderr); }
+            if (CopyTraceOn()) { std::fprintf(stderr, "[copy] %s wrote %zu\n", tagB, n); std::fflush(stderr); }
             diagB.Add(tagB, n);
         }
         TLSPut(raw);

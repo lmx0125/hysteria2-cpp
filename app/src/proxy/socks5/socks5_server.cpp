@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "hy2/client_udp.hpp"  // UdpConn::kReceiveTimeout
 #include "hy2/copy.hpp"
 #include "hy2/debug_print.hpp"
 
@@ -24,6 +25,7 @@
   #include <arpa/inet.h>
   #include <netdb.h>
   #include <netinet/in.h>
+  #include <netinet/tcp.h>
   #include <sys/socket.h>
   #include <unistd.h>
 #endif
@@ -122,19 +124,53 @@ bool parseSocks5UdpDatagram(const uint8_t* buf, size_t len, uint8_t& frag,
     return true;
 }
 
-// Build a SOCKS5 UDP datagram for sending to the client.
+// Append the SOCKS5 address field (ATYP ADDR PORT) for hostPort into `out`.
+// hostPort is "ip:port" / "[ipv6]:port" / "domain:port"; a string without a
+// colon contributes nothing, exactly as buildSocks5Address() always has.
+void buildSocks5AddressInto(std::vector<uint8_t>& out, const std::string& hostPort) {
+    auto colon = hostPort.rfind(':');
+    if (colon == std::string::npos) return;
+    std::string host = hostPort.substr(0, colon);
+    uint16_t port = static_cast<uint16_t>(std::atoi(hostPort.c_str() + colon + 1));
+
+    struct in_addr addr4{};
+    if (inet_pton(AF_INET, host.c_str(), &addr4) == 1) {
+        out.push_back(kAtypIPv4);
+        auto* p = reinterpret_cast<uint8_t*>(&addr4);
+        out.insert(out.end(), p, p + 4);
+    } else if (host.size() > 2 && host[0] == '[' && host.back() == ']') {
+        struct in6_addr addr6{};
+        std::string ip = host.substr(1, host.size() - 2);
+        if (inet_pton(AF_INET6, ip.c_str(), &addr6) == 1) {
+            out.push_back(kAtypIPv6);
+            auto* p = reinterpret_cast<uint8_t*>(&addr6);
+            out.insert(out.end(), p, p + 16);
+        }
+    } else {
+        out.push_back(kAtypDomain);
+        out.push_back(static_cast<uint8_t>(host.size()));
+        out.insert(out.end(), host.begin(), host.end());
+    }
+
+    out.push_back(static_cast<uint8_t>((port >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>(port & 0xFF));
+}
+
+// Build a SOCKS5 UDP datagram for sending to the client, into `out` (cleared
+// first, capacity kept). The relay sends one of these per received datagram,
+// so returning a fresh vector - plus a second temporary one for the address -
+// meant several allocations per packet for a buffer that is always the same
+// shape. The address lands directly in `out` and the 3-byte header is inserted
+// in front of it, which is cheaper than building the two separately and
+// copying both in.
 // Format: RSV(2)=0 FRAG(1)=0 ATYP ADDR PORT DATA
-std::vector<uint8_t> buildSocks5UdpDatagram(const std::string& hostPort,
-                                             const uint8_t* data, size_t dataLen) {
-    auto addrBytes = buildSocks5Address(hostPort);
-    std::vector<uint8_t> pkt;
-    pkt.reserve(4 + addrBytes.size() + dataLen);
-    pkt.push_back(0x00); // RSV
-    pkt.push_back(0x00); // RSV
-    pkt.push_back(0x00); // FRAG
-    pkt.insert(pkt.end(), addrBytes.begin(), addrBytes.end());
-    pkt.insert(pkt.end(), data, data + dataLen);
-    return pkt;
+void buildSocks5UdpDatagramInto(std::vector<uint8_t>& out, const std::string& hostPort,
+                                const uint8_t* data, size_t dataLen) {
+    out.clear();
+    buildSocks5AddressInto(out, hostPort);
+    out.reserve(3 + out.size() + dataLen);
+    out.insert(out.begin(), 3, 0x00);  // RSV RSV FRAG
+    out.insert(out.end(), data, data + dataLen);
 }
 
 #ifdef _WIN32
@@ -146,6 +182,16 @@ using socket_t = int;
 constexpr socket_t kInvalidSock = -1;
 inline void closeSock(socket_t s) { ::close(s); }
 #endif
+
+// Nagle holds a small write until the previous one is acknowledged, and on
+// Windows the delayed-ACK timer is 200 ms - an interactive request/response
+// stream through the proxy stutters by that much. The relay writes whole
+// buffers, so there is nothing worth coalescing here.
+inline void setTcpNoDelay(socket_t s) {
+    int on = 1;
+    setsockopt(s, IPPROTO_TCP, TCP_NODELAY,
+               reinterpret_cast<const char*>(&on), sizeof(on));
+}
 
 // SocketConn - wraps a raw TCP socket as hy2::server::IConn
 class SocketConn : public server::IConn {
@@ -221,34 +267,11 @@ std::string parseSocks5Address(uint8_t atyp, const uint8_t* addr, size_t addrLen
     return host + ":" + std::to_string(p);
 }
 
+// Kept for the module tests (Socks5_BuildSocks5Address_*); the UDP relay builds
+// the same bytes straight into its reusable datagram buffer instead.
 std::vector<uint8_t> buildSocks5Address(const std::string& hostPort) {
     std::vector<uint8_t> result;
-    auto colon = hostPort.rfind(':');
-    if (colon == std::string::npos) return result;
-    std::string host = hostPort.substr(0, colon);
-    uint16_t port = static_cast<uint16_t>(std::atoi(hostPort.c_str() + colon + 1));
-
-    struct in_addr addr4{};
-    if (inet_pton(AF_INET, host.c_str(), &addr4) == 1) {
-        result.push_back(kAtypIPv4);
-        auto* p = reinterpret_cast<uint8_t*>(&addr4);
-        result.insert(result.end(), p, p + 4);
-    } else if (host.size() > 2 && host[0] == '[' && host.back() == ']') {
-        struct in6_addr addr6{};
-        std::string ip = host.substr(1, host.size() - 2);
-        if (inet_pton(AF_INET6, ip.c_str(), &addr6) == 1) {
-            result.push_back(kAtypIPv6);
-            auto* p = reinterpret_cast<uint8_t*>(&addr6);
-            result.insert(result.end(), p, p + 16);
-        }
-    } else {
-        result.push_back(kAtypDomain);
-        result.push_back(static_cast<uint8_t>(host.size()));
-        result.insert(result.end(), host.begin(), host.end());
-    }
-
-    result.push_back(static_cast<uint8_t>((port >> 8) & 0xFF));
-    result.push_back(static_cast<uint8_t>(port & 0xFF));
+    buildSocks5AddressInto(result, hostPort);
     return result;
 }
 
@@ -298,6 +321,7 @@ std::shared_ptr<server::IConn> TcpListener::Accept() {
     int client = ::accept(fd_, nullptr, nullptr);
     if (client < 0) return nullptr;
 #endif
+    setTcpNoDelay(client);
     return std::make_shared<SocketConn>(client);
 }
 
@@ -661,16 +685,26 @@ void Socks5Server::handleUDP(std::shared_ptr<server::IConn> conn,
             clientAddrCv.wait(lk, [&] { return relayClientAddrReady || done.load(); });
         }
 
+        // Reused for every reply datagram (see buildSocks5UdpDatagramInto).
+        std::vector<uint8_t> pkt;
         while (!done.load(std::memory_order_relaxed)) {
             std::vector<uint8_t> data;
             std::string addr;
             try {
-                if (!hyUDP->Receive(data, addr)) break;
+                // Receive() returns false for a quiet poll as well as for a
+                // closed session, and this loop used to treat both as EOF -
+                // so any UDP flow with a >100 ms gap between replies (a DNS
+                // lookup, a QUIC handshake, a game keepalive) had its relay
+                // torn down mid-session. Ask which one it was instead.
+                const auto r = hyUDP->ReceivePacket(data, addr,
+                                                    hyUDP->ReceivePollTimeout());
+                if (r == client::UdpRecvResult::kClosed) break;
+                if (r == client::UdpRecvResult::kTimeout) continue;
             } catch (...) {
                 break;
             }
 
-            auto pkt = buildSocks5UdpDatagram(addr, data.data(), data.size());
+            buildSocks5UdpDatagramInto(pkt, addr, data.data(), data.size());
 
             // Send back to the client
             std::lock_guard<std::mutex> lk(clientAddrMu);

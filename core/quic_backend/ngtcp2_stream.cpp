@@ -78,7 +78,7 @@ size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
 
     // Wait for data or EOF — support deadline for timeout
     auto pred = [this] {
-        return readBuf_.size() > readPos_ || readEof_ || readClosed_;
+        return readBuf_.size() > 0 || readEof_ || readClosed_;
     };
     if (readDeadline_.ns > 0) {
         auto tp = std::chrono::steady_clock::time_point(
@@ -108,22 +108,21 @@ size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
     }
 
 
-    if (readPos_ >= readBuf_.size()) {
+    if (readBuf_.size() == 0) {
+        // FIN can arrive separately after the last data read. Flush its tail
+        // even when the caller keeps the write half open after EOF.
+        const uint64_t credit = recvCreditPending_;
+        recvCreditPending_ = 0;
+        lk.unlock();
+        if (credit > 0) {
+            if (auto c = conn_.lock()) c->ExtendReadCredit(streamId_, credit);
+        }
         return 0; // EOF
     }
 
-    size_t avail = readBuf_.size() - readPos_;
-    size_t toRead = std::min(n, avail);
-    std::memcpy(p, readBuf_.data() + readPos_, toRead);
-    readPos_ += toRead;
+    const size_t toRead = readBuf_.Read(p, n);
     StreamDiag("read", streamId_, toRead, static_cast<uint64_t>(readBuf_.size()),
-               static_cast<uint64_t>(readPos_));
-
-    // Compact buffer when fully consumed
-    if (readPos_ >= readBuf_.size()) {
-        readBuf_.clear();
-        readPos_ = 0;
-    }
+               static_cast<uint64_t>(readBuf_.capacity()));
 
     // Return flow-control credit for the consumed bytes. Consumption (not
     // arrival) drives the window, so the peer can never be more than the
@@ -134,7 +133,7 @@ size_t Ngtcp2Stream::Read(uint8_t* p, size_t n) {
     // readMu_ -> opMu_ here would be an ABBA deadlock.
     uint64_t credit = 0;
     recvCreditPending_ += toRead;
-    if (recvCreditPending_ >= kRecvCreditBatch) {
+    if (recvCreditPending_ >= kRecvCreditBatch || (readEof_ && readBuf_.size() == 0)) {
         credit = recvCreditPending_;
         recvCreditPending_ = 0;
     }
@@ -160,10 +159,21 @@ void Ngtcp2Stream::Write(const uint8_t* p, size_t n) {
     // Backpressure on unacknowledged bytes: block until the peer acks enough
     // of the backlog (OnAckedStreamData wakes us; the timed wait is only a
     // safety net).
-    while (tailOffset_ - ackedOffset_ > kMaxWriteBuf && !writeClosed_) {
-        writeCv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
-            return tailOffset_ - ackedOffset_ <= kMaxWriteBuf || writeClosed_;
-        });
+    if (tailOffset_.load(std::memory_order_relaxed) - ackedOffset_ > kMaxWriteBuf &&
+        !writeClosed_) {
+        writeBlockedCount_.fetch_add(1, std::memory_order_relaxed);
+        const auto blockedStart = std::chrono::steady_clock::now();
+        while (tailOffset_.load(std::memory_order_relaxed) - ackedOffset_ > kMaxWriteBuf &&
+               !writeClosed_) {
+            writeCv_.wait_for(lk, std::chrono::milliseconds(100), [this] {
+                return tailOffset_.load(std::memory_order_relaxed) - ackedOffset_ <= kMaxWriteBuf ||
+                       writeClosed_;
+            });
+        }
+        writeBlockedNs_.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - blockedStart).count()),
+            std::memory_order_relaxed);
     }
     if (writeClosed_) {
         throw hy2::Error("write side closed");
@@ -171,12 +181,12 @@ void Ngtcp2Stream::Write(const uint8_t* p, size_t n) {
 
     AppendWriteLocked(p, n);
     DBG_LOG("Ngtcp2Stream::Write: appended", "stream_id", streamId_,
-            "bytes", n, "unacked", tailOffset_ - ackedOffset_);
+            "bytes", n, "unacked", tailOffset_.load(std::memory_order_relaxed) - ackedOffset_);
     // Wake the event-loop thread so it flushes pending data immediately.
     // Edge-triggered: repeated writes inside one burst only pay the pipe
     // syscall once per false->true transition of the pending flag.
     if (auto c = conn_.lock()) c->WakeUpOnData();
-    StreamDiag("write", streamId_, n, tailOffset_ - ackedOffset_,
+    StreamDiag("write", streamId_, n, tailOffset_.load(std::memory_order_relaxed) - ackedOffset_,
                static_cast<uint64_t>(writeChunks_.size()));
 }
 
@@ -189,33 +199,71 @@ void Ngtcp2Stream::Close() {
           _hy2lt_117.done();
         if (!writeClosed_) {
             writeClosed_ = true;
-            finPending_ = true; // send FIN with the last data
+            finPending_.store(true, std::memory_order_relaxed); // send FIN with the last data
         }
         writeCv_.notify_all();
     }
+    if (auto c = conn_.lock()) c->WakeUpOnData();
 }
 
 void Ngtcp2Stream::CancelRead(StreamErrorCode code) {
-    (void)code;
+    // Flow-control credit for data this stream received but the application
+    // will never read. Two pools of it:
+    //   1. recvCreditPending_ - consumed-but-not-yet-flushed (< 256 KB by
+    //      definition, see kRecvCreditBatch);
+    //   2. readBuf_ unread tail - DELIVERED to the application level but
+    //      never Read(), so its ExtendReadCredit never ran. Without handing
+    //      this back, every abandoned stream permanently ate that many bytes
+    //      of the CONNECTION-level window (16 MB): enough seeks and the whole
+    //      QUIC connection stalled at 0 B/s even though it was perfectly
+    //      healthy - the exact "seek once, then 0 KB/s" report.
+    //      (Data still buffered inside ngtcp2 itself is credited by ngtcp2
+    //      automatically once STOP_SENDING is set - see its
+    //      conn_recv_stream's discard path - so only the delivered-to-app
+    //      tail is ours to return.)
+    uint64_t credit = 0;
+    bool abort = false;
     {
         hy2::diag::LockTimer _hy2lt_129("ngtcp2_stream:129 readMu_");
           std::lock_guard<std::mutex> lk(readMu_);
           _hy2lt_129.done();
+        abort = !readEof_;
         readClosed_ = true;
+        credit += recvCreditPending_;
+        recvCreditPending_ = 0;
+        credit += readBuf_.size();
+        readBuf_.clear();
+        // If the peer already FINed, it has nothing more to send and a
+        // graceful half-close is the right answer; STOP_SENDING would only
+        // turn every normal completion into an abort. The credit above is
+        // still owed in full.
     }
     readCv_.notify_all();
+    // readMu_ MUST be released before touching the connection (see the
+    // ExtendReadCredit comment: recv path takes opMu_ -> readMu_).
+    if (auto c = conn_.lock()) {
+        // Credit the connection window for the unread tail, then abort the
+        // stream - same op, so the credit and the STOP_SENDING land together.
+        if (abort) {
+            c->ShutdownStreamEx(streamId_, static_cast<uint64_t>(code), credit);
+        } else if (credit > 0) {
+            c->ExtendReadCredit(streamId_, credit);
+        }
+    }
 }
 
 void Ngtcp2Stream::CancelWrite(StreamErrorCode code) {
-    (void)code;
     {
         hy2::diag::LockTimer _hy2lt_138("ngtcp2_stream:138 writeMu_");
           std::lock_guard<std::mutex> lk(writeMu_);
           _hy2lt_138.done();
         writeClosed_ = true;
-        finPending_ = false;
+        finPending_.store(false, std::memory_order_relaxed);
     }
     writeCv_.notify_all();
+    if (auto c = conn_.lock()) {
+        c->ShutdownStream(streamId_, static_cast<uint64_t>(code));
+    }
 }
 
 uint64_t Ngtcp2Stream::StreamID() const {
@@ -227,29 +275,21 @@ void Ngtcp2Stream::OnStreamData(const uint8_t* data, size_t len, bool fin) {
       std::lock_guard<std::mutex> lk(readMu_);
       _hy2lt_150.done();
     if (len > 0) {
-        readBuf_.insert(readBuf_.end(), data, data + len);
+        readBuf_.Append(data, len);
     }
     if (fin) {
         readEof_ = true;
     }
     // No notify here: the connection flushes one wakeup per recv batch.
-    readDirty_ = true;
+    readDirty_.store(true, std::memory_order_release);
 }
 
 void Ngtcp2Stream::FlushReadNotify() {
-    bool need = false;
-    {
-        hy2::diag::LockTimer _hy2lt_164("ngtcp2_stream:164 readMu_");
-          std::lock_guard<std::mutex> lk(readMu_);
-          _hy2lt_164.done();
-        if (readDirty_) {
-            readDirty_ = false;
-            need = true;
-        }
+    // Lock-free check: exchange(false) atomically tests and clears the dirty flag
+    // without contending on readMu_ with the reader thread.
+    if (readDirty_.exchange(false, std::memory_order_acq_rel)) {
+        readCv_.notify_all();
     }
-    // Notify with the mutex released: the woken reader re-acquires readMu_
-    // immediately, so holding it here would make it spin first.
-    if (need) readCv_.notify_all();
 }
 
 void Ngtcp2Stream::OnStreamClose(uint64_t /*appErrorCode*/) {
@@ -281,10 +321,12 @@ void Ngtcp2Stream::OnAckedStreamData(uint64_t offset, uint64_t datalen) {
     // below it is safe to release (retransmissions can no longer need it).
     const uint64_t acked = offset + datalen;
     if (acked <= ackedOffset_) return;
-    const bool wasBlocked = tailOffset_ - ackedOffset_ > kMaxWriteBuf;
+    const bool wasBlocked =
+        tailOffset_.load(std::memory_order_relaxed) - ackedOffset_ > kMaxWriteBuf;
     ackedOffset_ = acked;
     DropAckedLocked();
-    if (wasBlocked && tailOffset_ - ackedOffset_ <= kMaxWriteBuf) {
+    if (wasBlocked &&
+        tailOffset_.load(std::memory_order_relaxed) - ackedOffset_ <= kMaxWriteBuf) {
         writeCv_.notify_all();
     }
 }
@@ -306,14 +348,15 @@ void Ngtcp2Stream::AppendWriteLocked(const uint8_t* p, size_t n) {
         if (writeChunks_.empty() ||
             writeChunks_.back().data.size() >= kWriteChunkSize) {
             writeChunks_.emplace_back();
-            writeChunks_.back().baseOffset = tailOffset_;
+            writeChunks_.back().baseOffset = tailOffset_.load(std::memory_order_relaxed);
             writeChunks_.back().data.reserve(kWriteChunkSize);
         }
         WriteChunk& back = writeChunks_.back();
         size_t space = kWriteChunkSize - back.data.size();
         size_t take = std::min(space, n);
         back.data.insert(back.data.end(), p, p + take);
-        tailOffset_ += take;
+        tailOffset_.store(tailOffset_.load(std::memory_order_relaxed) + take,
+                          std::memory_order_relaxed);
         p += take;
         n -= take;
     }
@@ -323,8 +366,10 @@ const uint8_t* Ngtcp2Stream::PeekPendingWrite(size_t* len, bool* fin) {
     hy2::diag::LockTimer _hy2lt_237("ngtcp2_stream:237 writeMu_");
       std::lock_guard<std::mutex> lk(writeMu_);
       _hy2lt_237.done();
-    *fin = finPending_;
-    if (sentOffset_ >= tailOffset_ || writeChunks_.empty()) {
+    *fin = finPending_.load(std::memory_order_relaxed);
+    if (sentOffset_.load(std::memory_order_relaxed) >=
+            tailOffset_.load(std::memory_order_relaxed) ||
+        writeChunks_.empty()) {
         *len = 0;
         return nullptr;
     }
@@ -333,8 +378,9 @@ const uint8_t* Ngtcp2Stream::PeekPendingWrite(size_t* len, bool* fin) {
     // sentOffset_. cursor_ makes this O(1) amortized.
     while (cursor_ < writeChunks_.size()) {
         const WriteChunk& c = writeChunks_[cursor_];
-        if (sentOffset_ < c.baseOffset + c.data.size()) {
-            const size_t off = static_cast<size_t>(sentOffset_ - c.baseOffset);
+        const uint64_t sent = sentOffset_.load(std::memory_order_relaxed);
+        if (sent < c.baseOffset + c.data.size()) {
+            const size_t off = static_cast<size_t>(sent - c.baseOffset);
             *len = c.data.size() - off;
             return c.data.data() + off;
         }
@@ -345,46 +391,45 @@ const uint8_t* Ngtcp2Stream::PeekPendingWrite(size_t* len, bool* fin) {
 }
 
 bool Ngtcp2Stream::HasPendingWrite() const {
-    hy2::diag::LockTimer _hy2lt_260("ngtcp2_stream:260 writeMu_");
-      std::lock_guard<std::mutex> lk(writeMu_);
-      _hy2lt_260.done();
+    // Deliberately lock-free: the connection calls this once per stream on
+    // every IO iteration to find the next stream with data
+    // (PickWritableStreamLocked), so N streams used to mean N mutex pairs per
+    // iteration. The three fields are atomic and every writer still holds
+    // writeMu_, so this reads live values; a stale one only costs another look,
+    // because every append is followed by WakeUpOnData().
     // Note: a locally-closed stream still needs to flush queued data + FIN.
-    return sentOffset_ < tailOffset_ || finPending_;
+    return sentOffset_.load(std::memory_order_relaxed) <
+               tailOffset_.load(std::memory_order_relaxed) ||
+           finPending_.load(std::memory_order_relaxed);
 }
 
 bool Ngtcp2Stream::FinPending() const {
-    hy2::diag::LockTimer _hy2lt_266("ngtcp2_stream:266 writeMu_");
-      std::lock_guard<std::mutex> lk(writeMu_);
-      _hy2lt_266.done();
-    return finPending_;
+    return finPending_.load(std::memory_order_relaxed);
 }
 
 void Ngtcp2Stream::AdvanceWrite(size_t n) {
-    hy2::diag::LockTimer _hy2lt_271("ngtcp2_stream:271 writeMu_");
-      std::lock_guard<std::mutex> lk(writeMu_);
-      _hy2lt_271.done();
-    // Only move the send cursor: the bytes stay buffered until the peer acks
+    if (n == 0) return;
+    // Lock-free cursor advance: the bytes stay buffered until the peer acks
     // them, because ngtcp2 re-reads them for retransmissions. Freeing happens
     // in OnAckedStreamData()/DropAckedLocked().
-    if (static_cast<uint64_t>(n) > tailOffset_ - sentOffset_) {
-        sentOffset_ = tailOffset_;  // defensive: never run past the tail
-    } else {
-        sentOffset_ += n;
+    uint64_t sent = sentOffset_.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint64_t tail = tailOffset_.load(std::memory_order_acquire);
+        const uint64_t nextSent = (static_cast<uint64_t>(n) > tail - sent) ? tail : (sent + n);
+        if (sentOffset_.compare_exchange_weak(sent, nextSent,
+                                              std::memory_order_release,
+                                              std::memory_order_relaxed)) {
+            break;
+        }
     }
 }
 
 void Ngtcp2Stream::ClearFinPending() {
-    hy2::diag::LockTimer _hy2lt_283("ngtcp2_stream:283 writeMu_");
-      std::lock_guard<std::mutex> lk(writeMu_);
-      _hy2lt_283.done();
-    finPending_ = false;
+    finPending_.store(false, std::memory_order_release);
 }
 
 void Ngtcp2Stream::SetFinPending() {
-    hy2::diag::LockTimer _hy2lt_288("ngtcp2_stream:288 writeMu_");
-      std::lock_guard<std::mutex> lk(writeMu_);
-      _hy2lt_288.done();
-    finPending_ = true;
+    finPending_.store(true, std::memory_order_release);
 }
 
 bool Ngtcp2Stream::IsClosed() const {
@@ -395,13 +440,17 @@ void Ngtcp2Stream::DiagPrint() {
     std::unique_lock<std::mutex> rl(readMu_, std::try_to_lock);
     std::unique_lock<std::mutex> wl(writeMu_, std::try_to_lock);
     std::fprintf(stderr,
-                 "[hb-stream] sid=%lld read=%s buf=%zu pos=%zu eof=%d dirty=%d rclosed=%d | "
+                 "[hb-stream] sid=%lld read=%s buf=%zu capacity=%zu eof=%d dirty=%d rclosed=%d | "
                  "write=%s tail=%llu sent=%llu acked=%llu chunks=%zu cursor=%zu fin=%d wclosed=%d\n",
                  (long long)streamId_, rl.owns_lock() ? "ok" : "LOCKED",
-                 readBuf_.size(), readPos_, (int)readEof_, (int)readDirty_, (int)readClosed_,
-                 wl.owns_lock() ? "ok" : "LOCKED", (unsigned long long)tailOffset_,
-                 (unsigned long long)sentOffset_, (unsigned long long)ackedOffset_,
-                 writeChunks_.size(), cursor_, (int)finPending_, (int)writeClosed_);
+                 rl.owns_lock() ? readBuf_.size() : 0, rl.owns_lock() ? readBuf_.capacity() : 0,
+                 rl.owns_lock() ? (int)readEof_ : -1, (int)readDirty_.load(std::memory_order_relaxed), rl.owns_lock() ? (int)readClosed_ : -1,
+                 wl.owns_lock() ? "ok" : "LOCKED",
+                 (unsigned long long)tailOffset_.load(std::memory_order_relaxed),
+                 (unsigned long long)sentOffset_.load(std::memory_order_relaxed),
+                 (unsigned long long)(wl.owns_lock() ? ackedOffset_ : 0),
+                 wl.owns_lock() ? writeChunks_.size() : 0, wl.owns_lock() ? cursor_ : 0,
+                 (int)finPending_.load(std::memory_order_relaxed), wl.owns_lock() ? (int)writeClosed_ : -1);
     std::fflush(stderr);
 }
 

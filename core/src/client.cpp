@@ -83,6 +83,7 @@ void Config::VerifyAndFill() {
     if (BandwidthCfg.MaxTx > 0) {
         QUICConfig.CongestionControl = "brutal";
         QUICConfig.BrutalRate = BandwidthCfg.MaxTx;
+        QUICConfig.BrutalDisableLossCompensation = BandwidthCfg.DisableLossCompensation;
     }
 }
 
@@ -94,6 +95,10 @@ public:
     std::shared_ptr<QStream> Orig;
     std::string PseudoLocalAddr;
     std::string PseudoRemoteAddr;
+    // Target address as passed to TCP(). With FastOpen the establishment is
+    // validated here (first Read) instead of in TCP(), so the diagnostic below
+    // needs the address this far down.
+    std::string TargetAddr;
     bool Established = false;
 
     size_t Read(uint8_t* p, size_t n) override {
@@ -101,9 +106,18 @@ public:
             // Read response
             auto resp = proto::ReadTCPResponse(*Orig);
             if (!resp.OK) {
+                Orig->Close();
                 throw DialError(resp.Message);
             }
             Established = true;
+            // The marker TCP() prints when it is not deferred, so a run with
+            // fast_open still shows one "response OK" line per flow.
+            static const bool diag = std::getenv("HY2_DIAG") != nullptr;
+            if (diag) {
+                std::fprintf(stderr, "[client] TCP %s: response OK (fast-open)\n",
+                             TargetAddr.c_str());
+                std::fflush(stderr);
+            }
         }
         return Orig->Read(p, n);
     }
@@ -111,6 +125,16 @@ public:
     void Write(const uint8_t* p, size_t n) override { Orig->Write(p, n); }
 
     void Close() override { Orig->Close(); }
+    void CloseWrite() override { Orig->CloseWrite(); }
+
+    // Forward to the QUIC stream so a caller holding only the IByteReaderWriter
+    // (Client::TCP()'s return type) can bound a read. The deferred fast-open
+    // response check in Read() above runs on the same stream, so the deadline
+    // covers it too - which is what makes the prober's data probe fail in
+    // seconds on a node that authenticates but never forwards anything.
+    void SetReadDeadline(MonoTime t) override {
+        if (Orig) Orig->SetReadDeadline(t);
+    }
 
     const std::string& LocalAddr() const { return PseudoLocalAddr; }
     const std::string& RemoteAddr() const { return PseudoRemoteAddr; }
@@ -167,6 +191,7 @@ public:
     std::shared_ptr<HyUDPConn> UDP() override;
     void Close() override;
     QuicStatsSnapshot Stats() const override;
+    bool IsOpen() const override { return conn_ && !conn_->IsClosed(); }
 
     // Throws ClosedError when the connection is gone.
     //
@@ -277,6 +302,7 @@ std::shared_ptr<IByteReaderWriter> ClientImpl::TCP(const std::string& addr) {
     tc->Orig = qStream;
     tc->PseudoLocalAddr = conn_->LocalAddr();
     tc->PseudoRemoteAddr = conn_->RemoteAddr();
+    tc->TargetAddr = addr;
 
     if (config_.FastOpen) {
         // Don't wait for the response when fast open is enabled.
@@ -414,6 +440,11 @@ public:
         return client_ ? client_->Stats() : QuicStatsSnapshot{};
     }
 
+    bool IsOpen() const override {
+        std::lock_guard<std::mutex> lk(m_);
+        return !closed_ && client_ && client_->IsOpen();
+    }
+
 private:
     void reconnect() {
         if (client_) {
@@ -479,6 +510,30 @@ std::shared_ptr<Client> NewReconnectableClient(
     }
     return std::make_shared<ReconnectableClientImpl>(*t, std::move(configFunc),
                                                      std::move(connectedFunc), lazy);
+}
+
+UdpRecvResult HyUDPConn::ReceivePacket(std::vector<uint8_t>& data, std::string& addr,
+                                       Duration timeout) {
+    // Default: drive the implementation's own Receive(). It reports false both
+    // on timeout and on close, and the two are indistinguishable from here -
+    // but a quiet session and a closed one differ in exactly one observable
+    // way: a closed connection reports EOF again immediately, whereas a quiet
+    // one keeps returning false for the whole deadline. Poll within the
+    // deadline so the caller still gets a timely kTimeout, and only report
+    // kClosed once the implementation is genuinely done. Implementations with
+    // a real wait (UdpConn) override this and answer in one step; this
+    // fallback exists so a third-party or test implementation that only knows
+    // Receive() still behaves correctly.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::nanoseconds(timeout.ns);
+    const auto perPoll = Duration::FromMillis(20);
+    for (;;) {
+        if (Receive(data, addr)) return UdpRecvResult::kPacket;
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return UdpRecvResult::kTimeout;
+        }
+        hy2::SleepFor(perPoll);
+    }
 }
 
 } // namespace hy2::client
